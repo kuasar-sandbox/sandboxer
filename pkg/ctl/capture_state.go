@@ -30,6 +30,7 @@ type HostRetirementPermit struct {
 	RunID        string `json:"run_id"`
 	CheckpointID string `json:"checkpoint_id"`
 	OperationID  string `json:"operation_id"`
+	DeferVMMExit bool   `json:"defer_vmm_exit,omitempty"`
 }
 
 func (p HostRetirementPermit) Validate() error {

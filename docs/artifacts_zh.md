@@ -1066,3 +1066,20 @@ S/E 后缀几何、确定性 ZIP 编码及 sparse prefix/append 视图由 `accel
 [Runtime：启动、控制、捕获与恢复](runtime_zh.md) | [Sandbox 配置参考](configuration_zh.md) | [Guest 内存与按需恢复](memory_zh.md) | [块存储：设备、可写状态与 Checkpoint](block-storage_zh.md) | [资源控制与 Usage 计量](resources_zh.md) | [Guest ABI：启动、应用与 Host 协议](guest-abi_zh.md) | [VMM 集成与 Cloud Hypervisor 补丁](vmm_zh.md)
 
 [组件入口](../README_zh.md) · [构建与补丁材料](../native-deps/README_zh.md)
+
+### 已冻结 Runtime 的延后物理退役（#476）
+
+对支持延后 VMM 退出的托管捕获，Checkpoint 不可逆提交后，原 Runtime 同步结束执行，
+停止后端、释放磁盘所有权及 RunDir，并完成终态 usage 和既有 retained 额度交接。
+Reset TAP 直接释放已暂停 CH 的 TAP/TAPFD，不执行 Guest 热拔除或恢复设备；随后发送
+SIGKILL。只有 Reset TAP（如有网络）及终止信号成功、宿主许可和资源控制器能力均确认、
+原 VMM 身份可证明时，才允许在 CH 完整退出前报告 RuntimeRetired。否则保持原同步退役。
+既有 TAPFD OPEN 对明确的 TUNSETIFF EBUSY 使用原获取超时内的有界重试，不重做端口分配。
+
+原 sandbox-ctl holder 负责唯一 reaper、旧私有映射及原有后台保存。运行退役不等于
+RAMReleased：本地 CaptureRecord v3 固定原 VMM 的 PID/start time、boot ID 和 cgroup
+dev/inode；正常及异常路径均要求真正的线程组退出及既有 RAM pin 证明。新运行的额度
+仍按现有 B + 所有未结清 R 核算。延后的 CH 清理不再写入新运行共用的 usage 文件；
+未采集的 CH CPU 尾段标记未知。S/E、Bundle 与 tarstream 格式不变。
+旧管理端未授权时使用原记录版本与同步 CH 退出；旧读取者对本地 v3 记录 fail closed，
+节点降级前需处理这些本地捕获（不可让旧版本管理仍含 v3 记录的目录）。

@@ -1179,3 +1179,25 @@ S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views a
 [Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Guest memory and lazy restore](memory.md) | [Block storage: devices, writable state and checkpoints](block-storage.md) | [Resource control and usage accounting](resources.md) | [Guest ABI: boot, applications and host protocols](guest-abi.md) | [VMM integration and Cloud Hypervisor patches](vmm.md)
 
 [Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)
+
+### Deferred physical retirement of a frozen runtime (#476)
+
+For negotiated managed captures, an irreversible checkpoint commit fences the
+old execution, joins its backends, releases ordinary disk and RunDir ownership,
+seals usage and transfers the existing retained charge. Reset TAP closes the
+paused CH's TAP/TAPFD references without guest hot-unplug or device resume,
+then sandbox-ctl sends SIGKILL. Only successful fencing, exact VMM identity,
+and host/controller capability allow RuntimeRetired before full CH exit.
+Otherwise the existing synchronous retirement remains. Existing TAPFD OPEN
+retries only explicit TUNSETIFF EBUSY within its original overall timeout.
+
+The same holder joins the sole CH reaper and releases retired private mappings
+as part of its existing background save. RuntimeRetired is not RAMReleased:
+local CaptureRecord v3 carries exact VMM PID/start time, boot ID and cgroup
+dev/inode; physical release requires actual thread-group exit and the existing
+RAM pin proof. The successor's B plus all unsettled R accounting is unchanged.
+Retired CH cleanup never rewrites the shared usage path; the unobserved native
+CPU tail is unknown. S/E, Bundle and tarstream formats are unchanged. An older
+host without the capability uses the original record version and synchronous
+CH exit. Older readers fail closed on local v3 records; handle these local
+captures before downgrading a node to a reader that does not support v3.

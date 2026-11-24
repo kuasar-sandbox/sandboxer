@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -209,5 +210,66 @@ func TestRetirementPublicationFailureReturnsAndRetries(t *testing.T) {
 	got, err := memorycheckpoint.ReadCurrent(directory)
 	if err != nil || !got.RuntimeRetired || !got.FileReady || !got.RAMReleased {
 		t.Fatalf("completed record=%+v err=%v", got, err)
+	}
+}
+
+func TestFrozenRetirementStopsBackendsBeforeCHExit(t *testing.T) {
+	process := &channelSignaler{sent: make(chan os.Signal, 1)}
+	exited, stopped, released := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go destroyFrozenMemory(process, nil, func() { close(released) }, exited, func() { close(stopped) }, discardLogf)
+	select {
+	case sig := <-process.sent:
+		if sig != syscall.SIGKILL {
+			t.Fatalf("unexpected signal: %v", sig)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("frozen CH not killed")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("backend cancellation waited for CH exit")
+	}
+	select {
+	case <-released:
+		t.Fatal("memory mutation barrier released before CH exited")
+	default:
+	}
+	close(exited)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("retirement did not finish")
+	}
+}
+
+func TestFrozenRetirementPreservesSystemdPhysicalExit(t *testing.T) {
+	r := &Runtime{state: runtimeRunning, environmentActive: true, exitDone: make(chan struct{})}
+	exited := make(chan struct{})
+	released := make(chan struct{})
+	process := &channelSignaler{sent: make(chan os.Signal, 1)}
+	result := make(chan error, 1)
+	go func() {
+		result <- frozenRetirement(r, process, nil, func() { close(released) }, exited, discardLogf)()
+	}()
+	select {
+	case sig := <-process.sent:
+		if sig != syscall.SIGKILL {
+			t.Errorf("unexpected frozen retirement signal: %v", sig)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("frozen retirement did not start")
+	}
+	r.mu.Lock()
+	exitErr := r.environmentExitErrorLocked()
+	r.mu.Unlock()
+	close(exited)
+	close(r.exitDone)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	<-released
+	if exitErr != nil {
+		t.Fatalf("frozen retirement lost systemd physical-exit classification: %v", exitErr)
 	}
 }

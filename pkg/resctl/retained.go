@@ -19,6 +19,16 @@ func (h *ControllerHooks) SupportsRetainedMemory() bool {
 	return h.retainedSupported
 }
 
+// SupportsDeferredVMMExit is separate from the holder handoff protocol.
+func (h *ControllerHooks) SupportsDeferredVMMExit() bool {
+	if h == nil || !h.Enabled() {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.retainedSupported && h.deferredVMMSupported
+}
+
 func (h *ControllerHooks) retentionCallLocked(ctx context.Context, typ string, capture resource.CaptureRetention) (*resource.RetainedMemory, error) {
 	if !h.Enabled() {
 		return &resource.RetainedMemory{MemoryID: capture.MemoryID, Epoch: capture.Epoch}, nil

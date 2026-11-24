@@ -61,6 +61,7 @@ type CaptureRecord struct {
 	FileReady       bool           `json:"file_ready"`
 	RAMReleased     bool           `json:"ram_released"`
 	Holder          HolderIdentity `json:"holder"`
+	VMM             *VMMIdentity   `json:"vmm,omitempty"`
 	SaveError       string         `json:"save_error,omitempty"`
 }
 
@@ -72,10 +73,13 @@ func (r CaptureRecord) Validate() error {
 		}
 	}
 
-	if (r.Version != Version && r.Version != RecordVersion) || !validCheckpointID(r.CheckpointID) || !validID(r.MemoryID) || r.Epoch == 0 || r.Producer.SandboxID == "" {
+	if (r.Version != Version && r.Version != RecordVersion && r.Version != DeferredVMMRecordVersion) || !validCheckpointID(r.CheckpointID) || !validID(r.MemoryID) || r.Epoch == 0 || r.Producer.SandboxID == "" {
 		return errors.New("memory checkpoint: invalid capture identity")
 	}
-	if r.Deleted && (r.Version != RecordVersion || !r.Committed) {
+	if (r.Version == DeferredVMMRecordVersion) != (r.VMM != nil) || r.VMM != nil && !r.VMM.valid() {
+		return errors.New("memory checkpoint: invalid deferred VMM proof")
+	}
+	if r.Deleted && (r.Version < RecordVersion || !r.Committed) {
 		return errors.New("memory checkpoint: invalid deleted capture")
 	}
 	if r.Aborted && (r.Committed || r.FileReady || (r.RuntimeRetired || r.RAMReleased) && !r.Discarded) {
@@ -102,7 +106,7 @@ func (r CaptureRecord) Lost() bool {
 func sameCaptureIdentity(a, b CaptureRecord) bool {
 	// A legacy record may be upgraded when its name is revoked. The schema
 	// version is not a capture identity; all physical and operation IDs are.
-	return a.Producer == b.Producer && a.CheckpointID == b.CheckpointID && a.HostOperationID == b.HostOperationID && a.MemoryID == b.MemoryID && a.Epoch == b.Epoch && a.Holder == b.Holder
+	return (a.VMM == nil && b.VMM == nil || a.VMM != nil && b.VMM != nil && *a.VMM == *b.VMM) && a.Producer == b.Producer && a.CheckpointID == b.CheckpointID && a.HostOperationID == b.HostOperationID && a.MemoryID == b.MemoryID && a.Epoch == b.Epoch && a.Holder == b.Holder
 }
 
 // RecordPath with a memoryID names one immutable attempt. Without one it
@@ -462,7 +466,7 @@ func reserveRecordWithSync(directory string, record CaptureRecord, syncDirectory
 	if err != nil {
 		return nil, err
 	}
-	w := &RecordWriter{path: p, lock: lock, record: record}
+	w := &RecordWriter{path: p, lock: lock, record: cloneCaptureRecord(record)}
 	fail := func(err error) (*RecordWriter, error) { return nil, errors.Join(err, w.Close()) }
 	records, err := checkpointRecords(directory, record.CheckpointID)
 	if err != nil {
@@ -519,14 +523,25 @@ func publishRecord(directory string, w *RecordWriter) error {
 	return writeJSON(filepath.Join(directory, "current-memory.json"), currentLocator{r.CheckpointID, r.MemoryID, r.Epoch})
 }
 
-func (w *RecordWriter) Path() string        { return w.path }
-func (w *RecordWriter) Read() CaptureRecord { w.mu.Lock(); defer w.mu.Unlock(); return w.record }
+func (w *RecordWriter) Path() string { return w.path }
+func cloneCaptureRecord(r CaptureRecord) CaptureRecord {
+	if r.VMM != nil {
+		v := *r.VMM
+		r.VMM = &v
+	}
+	return r
+}
+func (w *RecordWriter) Read() CaptureRecord {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return cloneCaptureRecord(w.record)
+}
 func (w *RecordWriter) Update(update func(*CaptureRecord)) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	r := w.record
+	r := cloneCaptureRecord(w.record)
 	update(&r)
-	if r.Deleted {
+	if r.Deleted && r.Version < RecordVersion {
 		r.Version = RecordVersion
 	}
 	if r.Version < w.record.Version || w.record.Deleted && !r.Deleted {

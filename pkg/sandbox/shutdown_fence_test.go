@@ -41,7 +41,7 @@ func TestShutdownFenceBoundsBlockedVMMAPIAndWaitsForReaper(t *testing.T) {
 				deadline = time.Now().Add(5 * time.Second)
 			}
 			go func() {
-				waited <- waitForCHWithSignalEscalation(done, signals, proc, 1, sock, dir, time.Minute, 5*time.Second, discardLogf, func() time.Time { return deadline })
+				waited <- waitForCHWithSignalEscalation(done, signals, proc, 1, sock, dir, time.Minute, 5*time.Second, discardLogf, chShutdownOptions{deadline: func() time.Time { return deadline }})
 			}()
 			signals <- syscall.SIGTERM
 			select {
@@ -80,5 +80,47 @@ func TestShutdownFenceBoundsBlockedVMMAPIAndWaitsForReaper(t *testing.T) {
 				t.Fatal("actual reaper completion ignored")
 			}
 		})
+	}
+}
+
+func TestShutdownFenceKillsFrozenCaptureWithoutVMMAPI(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "stop-frozen-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.WriteFile(filepath.Join(dir, "memory.high"), []byte("max"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sock, requests := serveLifecycleCH(t, dir, func(string) int { return http.StatusNoContent })
+	done := make(chan error, 1)
+	signals := make(chan os.Signal, 1)
+	sent := make(chan os.Signal, 4)
+	waited := make(chan error, 1)
+	go func() {
+		waited <- waitForCHWithSignalEscalation(done, signals, &channelSignaler{sent: sent},
+			1, sock, dir, time.Second, time.Second, discardLogf,
+			chShutdownOptions{frozen: func() bool { return true }})
+	}()
+	signals <- syscall.SIGTERM
+	select {
+	case sig := <-sent:
+		if sig != syscall.SIGKILL {
+			t.Errorf("frozen capture received %v", sig)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("frozen capture did not receive a kill")
+	}
+	select {
+	case err := <-waited:
+		t.Fatalf("signal substituted for actual retirement: %v", err)
+	default:
+	}
+	done <- nil
+	if err := <-waited; err != nil {
+		t.Fatal(err)
+	}
+	if got := requests(); len(got) != 0 {
+		t.Fatalf("frozen capture used VMM shutdown API: %v", got)
 	}
 }

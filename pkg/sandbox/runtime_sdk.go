@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -164,6 +165,10 @@ type Runtime struct {
 	shutdownGuest            func(context.Context) error
 	shutdownGrace            time.Duration
 	memorySave               *checkpointMemorySave
+	stopFrozenBackends       func()
+	resetFrozenTaps          func() bool
+	retireFrozenRuntime      func()
+	vmmIdentity              *memorycheckpoint.VMMIdentity
 	diskSnapshot             *SnapshotHandler
 	diskLaunch               LaunchSpec
 	diskInventory            []diskEntry

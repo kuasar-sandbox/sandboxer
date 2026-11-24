@@ -712,6 +712,11 @@ type processSignaler interface {
 	Signal(sig os.Signal) error
 }
 
+type chShutdownOptions struct {
+	deadline func() time.Time
+	frozen   func() bool
+}
+
 // waitForCHWithSignalEscalation blocks until doneCh fires, driving CH
 // shutdown when host SIGTERM/SIGINT arrives. Shutdown path (in order):
 //
@@ -740,8 +745,13 @@ func waitForCHWithSignalEscalation(
 	chRespDeadline time.Duration,
 	grace time.Duration,
 	logf func(format string, args ...any),
-	deadlineSources ...func() time.Time,
+	options ...chShutdownOptions,
 ) error {
+	var control chShutdownOptions
+	if len(options) > 0 {
+		control = options[0]
+	}
+	isFrozen := func() bool { return control.frozen != nil && control.frozen() }
 	var killTimer *time.Timer
 	var killCh <-chan time.Time
 	var drainTimer *time.Timer
@@ -757,11 +767,8 @@ func waitForCHWithSignalEscalation(
 	var apiResult <-chan error
 	startDeadline := func() {
 		deadline := time.Now().Add(grace)
-		for _, source := range deadlineSources {
-			if source == nil {
-				continue
-			}
-			if ownerDeadline := source(); !ownerDeadline.IsZero() && ownerDeadline.Before(deadline) {
+		if control.deadline != nil {
+			if ownerDeadline := control.deadline(); !ownerDeadline.IsZero() && ownerDeadline.Before(deadline) {
 				deadline = ownerDeadline
 			}
 		}
@@ -771,6 +778,10 @@ func waitForCHWithSignalEscalation(
 		killCh = killTimer.C
 	}
 	finishShutdownRequest := func(sig os.Signal, useAPI bool) {
+		if isFrozen() {
+			_ = proc.Signal(syscall.SIGKILL)
+			return
+		}
 		if useAPI {
 			result := make(chan error, 1)
 			apiResult = result
@@ -806,6 +817,11 @@ func waitForCHWithSignalEscalation(
 						return
 					}
 					memoryHighLockRetryDeadline = time.Time{}
+					if isFrozen() {
+						logf("received %v, memory.high lifecycle lock remained busy; sending SIGKILL to fence potential capture", sig)
+						_ = proc.Signal(syscall.SIGKILL)
+						return
+					}
 					logf("received %v, memory.high lifecycle lock remained busy for %s; falling back to SIGTERM", sig, memoryHighLockRetryWindow)
 				} else {
 					memoryHighLockRetryDeadline = time.Time{}
@@ -869,8 +885,12 @@ func waitForCHWithSignalEscalation(
 		case err := <-apiResult:
 			apiResult = nil
 			if err != nil {
-				logf("vmm.shutdown API failed (%v), forwarding SIGTERM within the original deadline", err)
-				_ = proc.Signal(syscall.SIGTERM)
+				if isFrozen() {
+					_ = proc.Signal(syscall.SIGKILL)
+				} else {
+					logf("vmm.shutdown API failed (%v), forwarding SIGTERM within the original deadline", err)
+					_ = proc.Signal(syscall.SIGTERM)
+				}
 			}
 		case <-killCh:
 			logf("CH reached the shutdown deadline, sending SIGKILL pid=%d", chPid)
