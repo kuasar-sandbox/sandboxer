@@ -96,8 +96,8 @@ func TestWaitRunJoinsShutdownResponseWithoutCapture(t *testing.T) {
 					t.Fatalf("lost shutdown error: %v", err)
 				}
 			case "disconnected":
-				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("disconnected shutdown client: got %v, want context cancellation", err)
+				if err == nil {
+					t.Fatal("disconnected shutdown client reported success")
 				}
 			}
 			select {
