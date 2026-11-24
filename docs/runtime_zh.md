@@ -220,7 +220,7 @@ failed 或 exited。快速 app_started 和既有 Pinger 的已校验 Pong 将同
 成功要求 ACK 和 MUX；failed/terminal 也可结束 ACK 前等待。旧 token 被忽略，
 非法状态失败，迟到 started 不能覆盖确定终止错误。
 
-不带托管 readiness 或 checkpoint 所有权的独立 `sandbox-ctl run` 可能在运行态确认
+未启用 systemd、且不带托管 readiness 或 checkpoint 所有权的独立 `sandbox-ctl run` 可能在运行态确认
 前完成短任务。相同 Launch token、实际已启动的 PID 及成功退出终态即使早于 Host
 ACK/MUX 发布也会被保留；两道屏障均完成后，才可直接等待正常 VMM 退出和清理，不
 发布 ready。迟到的 started 事实不能覆盖该终态。公共 SDK Launch/Start 和托管 readiness

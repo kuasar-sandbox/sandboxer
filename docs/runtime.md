@@ -264,7 +264,7 @@ are insufficient. Success requires ACK and MUX; failed/terminal facts also end
 pre-ACK waiting. Old tokens are ignored, invalid states fail, and late started
 cannot overwrite a terminal error.
 
-A standalone `sandbox-ctl run` without managed readiness or checkpoint ownership
+A standalone `sandbox-ctl run` with systemd disabled, without managed readiness or checkpoint ownership
 may finish a short command before initial running-state confirmation. A matching
 terminal fact with the actual started PID and a successful exit is retained
 even if it arrives before host-side ACK/MUX publication. Only after both
