@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -53,9 +55,11 @@ func TestCaptureResponsePrecedesDestroy(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer mfd.Close()
+			portable := snapshotTestLivePortable(t)
+			portable.Boot.Runtime = "file://captured-v1.bundle@digest:" + strings.Repeat("a", 64)
 			handler := &SnapshotHandler{
 				Context: context.Background(),
-				Cfg:     &config.SandboxConfig{}, PortableConfig: snapshotTestLivePortable(t), SandboxID: "test",
+				Cfg:     &config.SandboxConfig{Boot: config.BootConfig{Runtime: "file:///host/current-v2.bundle"}}, PortableConfig: portable, SandboxID: "test",
 				Memfd: mfd,
 				Disks: []SnapDiskRef{{Size: 4096, SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
 					return bytes.NewReader(make([]byte, 4096)), nil, nil
@@ -87,7 +91,7 @@ func TestCaptureResponsePrecedesDestroy(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() { _ = server.Serve(ctx); close(done) }()
-			defer func() { cancel(); server.Stop(); <-done }()
+			defer func() { unblock(); cancel(); server.Stop(); <-done }()
 			conn, err := net.Dial("unix", server.Path)
 			if err != nil {
 				t.Fatal(err)
@@ -124,6 +128,12 @@ func TestCaptureResponsePrecedesDestroy(t *testing.T) {
 			}
 			if response.Type != expected {
 				t.Fatalf("reply type=%q want %q", response.Type, expected)
+			}
+			if kind == ctl.TypeSnapshotRequest {
+				ref, err := manifest.ParseRef(response.SnapshotRef)
+				if err != nil || ref.Runtime != (manifest.RuntimeIdentity{Basename: "captured-v1.bundle", Digest: strings.Repeat("a", 64)}) {
+					t.Fatalf("host default replaced captured runtime: %s: %v", response.SnapshotRef, err)
+				}
 			}
 			select {
 			case <-shutdown:

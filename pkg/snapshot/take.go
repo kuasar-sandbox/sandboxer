@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -178,6 +179,17 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	}
 	if err := s.PortableConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("snapshot C0: %w", err)
+	}
+	// This is the immutable runtime identity of this capture, which may differ
+	// from the host's current default. Validate before pausing the VM; never
+	// infer a declaration by reopening an artifact or reading host settings.
+	runtimeRef, err := manifest.ParseRef(s.PortableConfig.Boot.Runtime)
+	if err != nil || runtimeRef.Scheme != manifest.RefSchemeFile || runtimeRef.DigestScheme != "digest" || runtimeRef.Location != "" || !runtimeRef.Runtime.IsZero() {
+		return nil, errors.New("snapshot C0: boot.runtime must be a file basename with a content digest")
+	}
+	runtimeIdentity := manifest.RuntimeIdentity{Basename: runtimeRef.Path, Digest: runtimeRef.Digest}
+	if err := runtimeIdentity.Validate(); err != nil {
+		return nil, fmt.Errorf("snapshot C0 boot.runtime: %w", err)
 	}
 	if len(s.Diffs) != 1+len(s.PortableConfig.Boot.Disks) {
 		return nil, fmt.Errorf("snapshot: runtime disk count %d does not match C0 disk count %d", len(s.Diffs), 1+len(s.PortableConfig.Boot.Disks))
@@ -400,6 +412,14 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
+	// Attach scheduling metadata before the holder's durable commit. The sink
+	// still commits the same content key; only the external Snapshot S gains it.
+	snapshotRef, err := manifest.ParseRef(out.SnapshotRef)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot output ref: %w", err)
+	}
+	snapshotRef.Runtime = runtimeIdentity
+	out.SnapshotRef = snapshotRef.String()
 	if s.FrozenMemory != nil {
 		if err := s.FrozenMemory.Commit(out); err != nil {
 			if errors.Is(err, ErrFrozenMemoryCommitted) {

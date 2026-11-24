@@ -78,8 +78,16 @@ the content graph: `snapshot.cfg` parent references and physical Bundle dependen
 refs use the base reference. Re-snapshotting an annotated input therefore does not
 change parent keys, introduce extra layers, or add another data-reading path.
 Actual runtime compatibility is still checked from the captured portable config
-at restore time. Reader support must be deployed before annotated captures are
-enabled; this consumer change alone does not enable new capture output.
+at restore time.
+
+A new memory capture declares the basename and content digest from its own
+immutable `PortableConfig.Boot.Runtime`. The declaration is attached before the
+holder commits its existing CaptureRecord, so a lost reply or later background
+save cannot replace it with the host's current default. Re-exporting an existing
+unannotated source does not invent a declaration. There is no new runtime column,
+data-reading path, or declaration-versus-payload validator. Deliver the updated
+Accelerator, Sandboxer and Orchestrator readers before deploying this producer;
+old readers are not supported consumers of annotated output.
 
 <a id="platform-boundary"></a>
 

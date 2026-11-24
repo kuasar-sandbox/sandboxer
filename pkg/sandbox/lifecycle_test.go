@@ -2161,7 +2161,7 @@ func snapshotTestPortable(t *testing.T) *config.PortableSandboxConfig {
 			Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
 		Boot: config.PortableBootConfig{
-			Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime@digest:" + key,
+			Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime.bundle@digest:" + key,
 			Root: config.PortableRootConfig{Base: "file://base@digest:" + key, Overlay: &config.PortableOverlayConfig{Base: "self"}},
 		},
 		Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},

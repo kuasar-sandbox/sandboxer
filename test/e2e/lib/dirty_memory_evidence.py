@@ -25,7 +25,9 @@ def validate(directory, output):
         result = json.loads((output / (name + ".json")).read_text())
         assert compared["complete_comparison"] == "equal" and compared["logical_bytes"] == size
         assert compared["sha256"] == observation["sha256"], "wrong frozen round"
-        assert result["snapshotRef"].rsplit("@", 1)[1] == compared["layers"][0]["Identity"], "wrong snapshot identity"
+        # This plaintext file carrier's first qualifier is its content identity.
+        # Later location/runtime annotations must not replace that identity.
+        assert result["snapshotRef"].split("@", 2)[1] == compared["layers"][0]["Identity"], "wrong snapshot identity"
         if name == "h":
             top = compared["layers"][0]
             assert top["Data"] == size and top["Zero"] == 0 and top["DirtyPresent"], "false top must preserve full W and its clean metadata"
