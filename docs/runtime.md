@@ -266,9 +266,11 @@ cannot overwrite a terminal error.
 
 A standalone `sandbox-ctl run` without managed readiness or checkpoint ownership
 may finish a short command before initial running-state confirmation. A matching
-terminal fact with the actual started PID and a successful exit is sufficient
-for the executable to join normal VMM exit and cleanup without emitting a
-ready event. Public SDK Launch/Start and managed readiness retain the running
+terminal fact with the actual started PID and a successful exit is retained
+even if it arrives before host-side ACK/MUX publication. Only after both
+barriers open can the executable join normal VMM exit and cleanup without
+emitting a ready event; a late started fact cannot overwrite that terminal
+proof. Public SDK Launch/Start and managed readiness retain the running
 state requirement; cancellation, missing start proof, failure, and cleanup
 errors are not converted into success.
 
