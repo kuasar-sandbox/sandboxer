@@ -1685,6 +1685,9 @@ func requireRuntimeFileAbs(field, uri string) error {
 	if ref.Location != "" {
 		return fmt.Errorf("%s does not support named ref locations", field)
 	}
+	if !ref.Runtime.IsZero() {
+		return fmt.Errorf("%s must not contain snapshot runtime metadata", field)
+	}
 	if !filepath.IsAbs(ref.Path) {
 		return fmt.Errorf("%s file:// must be absolute (got %q)", field, uri)
 	}

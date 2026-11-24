@@ -24,6 +24,32 @@ type PublishReport struct {
 	RemovedRefs []string `json:"removedRefs"`
 }
 
+func (r PublishResult) withSnapshotRuntime(runtime manifest.RuntimeIdentity, original string) (PublishResult, error) {
+	annotate := func(raw string) (string, error) {
+		ref, err := manifest.ParseRef(raw)
+		if err != nil {
+			return "", err
+		}
+		ref.Runtime = runtime
+		return ref.String(), nil
+	}
+	var err error
+	r.Ref, err = annotate(r.Ref)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	for i, raw := range r.RemovedRefs {
+		if raw == original {
+			r.RemovedRefs[i], err = annotate(raw)
+			if err != nil {
+				return PublishResult{}, err
+			}
+		}
+	}
+	sort.Strings(r.RemovedRefs)
+	return r, nil
+}
+
 // PublicRef projects a local reference into the caller's checkpoint namespace.
 // Identity qualifiers are preserved; projection performs no filesystem I/O.
 func PublicRef(raw string) (string, error) {
@@ -104,6 +130,9 @@ func (r PublishReport) validate(role LogicalRole, local bool) error {
 		}
 		if ref.Scheme == manifest.RefSchemeFile && !strings.HasSuffix(ref.Path, ".bundle") && !strings.HasSuffix(ref.Path, "."+string(role)) {
 			return errors.New("publication report: file root role mismatch")
+		}
+		if role != RoleSnapshot && !ref.Runtime.IsZero() {
+			return errors.New("publication report: only a snapshot root may declare a runtime")
 		}
 		safe, err := PublicRef(raw)
 		if err != nil || safe != raw {
@@ -248,6 +277,8 @@ func scopedRef(raw string, scope publishScope) string {
 	if err != nil {
 		return raw
 	}
+	ref = ref.Base()
+	raw = ref.String()
 	if ref.Scheme == manifest.RefSchemeManifest {
 		if bound, ok := scope.bindings[raw]; ok {
 			return bound

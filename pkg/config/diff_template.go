@@ -71,6 +71,9 @@ func ParseDiffTemplate(raw string) (DiffTemplateRef, error) {
 	if r.String() != raw {
 		return DiffTemplateRef{}, fmt.Errorf("diff_template: noncanonical source reference")
 	}
+	if !r.Runtime.IsZero() {
+		return DiffTemplateRef{}, fmt.Errorf("diff_template: snapshot runtime declaration is not applicable")
+	}
 	kind := DiffTemplateManifest
 	if r.Scheme == manifest.RefSchemeFile {
 		if r.Location == "" && !filepath.IsAbs(r.Path) {

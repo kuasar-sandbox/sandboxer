@@ -286,6 +286,11 @@ func run(ctx context.Context, opts Options) (code int, retErr error) {
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
 	runtimeMemoryRef := root.selfRef
+	memoryRef, err := manifest.ParseRef(runtimeMemoryRef)
+	if err != nil {
+		return -1, fmt.Errorf("snapshot memory binding: %w", err)
+	}
+	runtimeMemoryRef = memoryRef.Base().String()
 	selfRef := runtimeMemoryRef
 	if root.bundleRoot != "" {
 		selfRef = "manifest://" + root.bundleRoot
@@ -1225,6 +1230,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 						physical.Path = filepath.Join(filepath.Dir(opts.SnapshotPath), physical.Path)
 					}
 				}
+				physical = physical.Base()
 				physical.DigestScheme, physical.Digest = "manifest", ref.Path
 				source.SelectedRef = physical.String()
 				path, resolveErr := opts.RefLocations.ResolveFile(physical, filepath.Dir(opts.SnapshotPath))
@@ -1605,6 +1611,13 @@ func fileBundleRef(path, rawRef string, key store.ContentKey) (string, error) {
 	}
 	ref.DigestScheme = "manifest"
 	ref.Digest = manifest.HexKey(key)
+	if rawRef != "" {
+		original, err := manifest.ParseRef(rawRef)
+		if err != nil {
+			return "", err
+		}
+		ref.Runtime = original.Runtime
+	}
 	if err := ref.Validate(); err != nil {
 		return "", err
 	}
@@ -1648,6 +1661,7 @@ func fileBundleSource(path, rawRef string) (string, string, error) {
 		}
 	}
 	ref.Path = filepath.Base(real)
+	ref = ref.Base()
 	ref.DigestScheme = ""
 	ref.Digest = ""
 	if err := ref.Validate(); err != nil {

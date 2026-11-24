@@ -14,7 +14,7 @@ spec.loader.exec_module(evidence)
 
 class EvidenceTest(unittest.TestCase):
     def test_associations_fail_closed(self):
-        for change in ("valid", "empty", "missing", "extra", "sparse", "wrong-pid", "wrong-round", "stale-run", "wrong-hash", "wrong-identity", "thin-false", "missing-bitmap", "true-extra-layer", "true-unexpected-bitmap"):
+        for change in ("valid", "valid-runtime", "valid-location-runtime", "wrong-identity-runtime", "empty", "missing", "extra", "sparse", "wrong-pid", "wrong-round", "stale-run", "wrong-hash", "wrong-identity", "thin-false", "missing-bitmap", "true-extra-layer", "true-unexpected-bitmap"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 out = Path(directory)
                 ram = out / "ram"
@@ -34,12 +34,17 @@ class EvidenceTest(unittest.TestCase):
                         if change == "wrong-hash": compared["sha256"] = "wrong"
                         if change == "thin-false": top["Data"] -= 4096
                         if change == "missing-bitmap": top["DirtyPresent"] = False
-                        if change == "wrong-identity": top["Identity"] = "digest:wrong"
+                        if change in ("wrong-identity", "wrong-identity-runtime"): top["Identity"] = "digest:wrong"
                     if name == "c2":
                         if change == "true-extra-layer": compared["layers"].append(copy.copy(top))
                         if change == "true-unexpected-bitmap": top["DirtyPresent"] = True
                     (out / (name + "-comparison.json")).write_text(json.dumps(compared))
-                    (out / (name + ".json")).write_text(json.dumps(dict(snapshotRef=f"file://{name}@digest:{name}")))
+                    ref = f"file://{name}@digest:{name}"
+                    if change == "valid-location-runtime":
+                        ref += "@location:portable"
+                    if change in ("valid-runtime", "valid-location-runtime", "wrong-identity-runtime"):
+                        ref += "@runtime:sandbox-runtime.bundle:digest:" + "a" * 64
+                    (out / (name + ".json")).write_text(json.dumps(dict(snapshotRef=ref)))
                 (out / "w2-comparison.json").write_text(json.dumps(dict(layers=[dict(Data=256 << 20, Zero=0)])))
                 if change == "empty": captures = []
                 if change == "missing": captures.pop()
@@ -50,7 +55,7 @@ class EvidenceTest(unittest.TestCase):
                 if change == "stale-run": observations[0]["run_id"] = "stale"
                 (ram / "observations.jsonl").write_text("\n".join(map(json.dumps, observations)))
                 (ram / "capture-residency.jsonl").write_text("\n".join(map(json.dumps, captures)))
-                if change == "valid":
+                if change in ("valid", "valid-runtime", "valid-location-runtime"):
                     self.assertEqual(evidence.validate(ram,out)["captures"],2)
                 else:
                     with self.assertRaises(AssertionError): evidence.validate(ram,out)

@@ -26,6 +26,7 @@ func (p *Publisher) publishBundle(
 	rootRef string,
 	scope, rootScope publishScope,
 	first *OpenedFile,
+	snapshotOnly bool,
 ) (result PublishResult, retErr error) {
 	root, ok := first.RootManifestKey()
 	if !ok {
@@ -33,8 +34,11 @@ func (p *Publisher) publishBundle(
 		return PublishResult{}, errors.New("publish Bundle: carrier has no root Manifest")
 	}
 	role, dependencies, sandboxRef, err := p.inspectBundleRoot(ctx, rootRef, scope, rootScope, first, root)
+	if snapshotOnly && (err == nil || errors.Is(err, errBundleCheckpoint)) && role != RoleSnapshot {
+		return PublishResult{}, errors.New("runtime declaration requires a Snapshot root")
+	}
 	if errors.Is(err, errBundleCheckpoint) {
-		return p.publishCheckpointBundle(ctx, rootRef, scope)
+		return p.publishCheckpointBundle(ctx, rootRef, scope, snapshotOnly)
 	}
 	if err != nil {
 		return PublishResult{}, err
@@ -185,7 +189,7 @@ func (p *Publisher) inspectBundleRoot(
 	if sandboxRoot, err := sandboxfile.Open(ctx, first); err == nil {
 		defer func() { retErr = errors.Join(retErr, sandboxRoot.Close()) }()
 		if sandboxRoot.Checkpoint != nil {
-			return "", nil, "", errBundleCheckpoint
+			return RoleSandbox, nil, "", errBundleCheckpoint
 		}
 		if err := p.retainLocatedDisks(sandboxRoot.Portable, rootScope); err != nil {
 			return "", nil, "", err
@@ -206,7 +210,7 @@ func (p *Publisher) inspectBundleRoot(
 	}
 	defer func() { retErr = errors.Join(retErr, stream.Close()) }()
 	if snapshotRoot.LocalCheckpoint != nil {
-		return "", nil, "", errBundleCheckpoint
+		return RoleSnapshot, nil, "", errBundleCheckpoint
 	}
 	cfg, err := snapshot.ParseConfig(snapshotRoot.SnapshotConfig)
 	if err != nil {
@@ -244,7 +248,7 @@ func (p *Publisher) inspectBundleRoot(
 	}
 	defer func() { retErr = errors.Join(retErr, sandboxRoot.Close()) }()
 	if sandboxRoot.Checkpoint != nil {
-		return "", nil, "", errBundleCheckpoint
+		return RoleSnapshot, nil, "", errBundleCheckpoint
 	}
 	if err := p.retainLocated(cfg.SandboxRef, childScope); err != nil {
 		return "", nil, "", err
@@ -308,6 +312,7 @@ func appendManifestDependency(raw, label string, seen map[store.ContentKey]struc
 
 func bundleMemberRef(carrier string, key store.ContentKey) string {
 	ref, _ := manifest.ParseRef(carrier)
+	ref = ref.Base()
 	ref.DigestScheme, ref.Digest = "manifest", manifest.HexKey(key)
 	return ref.String()
 }
@@ -338,7 +343,7 @@ func (p *Publisher) retainLocatedDisks(cfg *config.PortableSandboxConfig, scope 
 // location. It remains a different physical carrier; selectors must name it.
 func selectedBundleCarrier(current, selected string) string {
 	if selected == "" {
-		return current
+		selected = current
 	}
 	ref, err := manifest.ParseRef(selected)
 	if err != nil {
@@ -348,10 +353,10 @@ func selectedBundleCarrier(current, selected string) string {
 	if err == nil && ref.Scheme == manifest.RefSchemeFile && ref.Location == "" && filepath.Base(ref.Path) == ref.Path {
 		ref.Location = parent.Location
 	}
-	return ref.String()
+	return ref.Base().String()
 }
 
-func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, scope publishScope) (PublishResult, error) {
+func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, scope publishScope, snapshotOnly bool) (PublishResult, error) {
 	// Materializing pinned DIFF versions changes E's logical contents. The
 	// snapshot must then reference that new E. Re-encode the graph in the
 	// input Bundle format when publishing to a named directory.
@@ -383,6 +388,9 @@ func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, sco
 	}
 	root, err := sandboxfile.Open(ctx, stream)
 	if err == nil {
+		if snapshotOnly {
+			return PublishResult{}, errors.Join(errors.New("runtime declaration requires a Snapshot root"), root.Close())
+		}
 		ref, err := p.publishSandboxRoot(ctx, raw, child, root)
 		return p.result(RoleSandbox, ref, ref), err
 	}

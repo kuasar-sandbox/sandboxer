@@ -846,6 +846,9 @@ func validatePortableRef(field, raw string, allowSelf bool) error {
 	if err != nil {
 		return fmt.Errorf("portable %s: %w", field, err)
 	}
+	if !ref.Runtime.IsZero() {
+		return fmt.Errorf("portable %s must not contain snapshot runtime metadata", field)
+	}
 	if ref.Scheme == manifest.RefSchemeFile {
 		if filepath.IsAbs(ref.Path) || filepath.Base(ref.Path) != ref.Path || strings.ContainsAny(ref.Path, `/\\`) {
 			return fmt.Errorf("portable %s local ref must use a basename", field)

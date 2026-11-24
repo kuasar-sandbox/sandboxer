@@ -2124,8 +2124,12 @@ func handleSnapshotRequest(
 	// OverlayRef stays scheme-tagged as a compatibility mirror of SandboxRef.
 	_, bundleRes := ingestSink.Results()
 	sandboxRes := ingestSink.SandboxResult()
-	resp.SnapshotManifestKey = strings.TrimPrefix(out.SnapshotRef, "manifest://")
-	resp.SandboxManifestKey = strings.TrimPrefix(out.SandboxRef, "manifest://")
+	if ref, err := manifest.ParseRef(out.SnapshotRef); err == nil && ref.Scheme == manifest.RefSchemeManifest {
+		resp.SnapshotManifestKey = ref.Path
+	}
+	if ref, err := manifest.ParseRef(out.SandboxRef); err == nil && ref.Scheme == manifest.RefSchemeManifest {
+		resp.SandboxManifestKey = ref.Path
+	}
 	resp.OverlayManifestKey = resp.SandboxManifestKey
 	resp.OverlayRef = out.SandboxRef
 	if sandboxRes != nil && bundleRes != nil {
@@ -3020,13 +3024,17 @@ func bundleKnownRefPaths(opts RunOptions) map[string]string {
 		if identity == "" || source == "" {
 			return
 		}
+		logical, err := manifest.ParseRef(identity)
+		if err != nil {
+			return
+		}
 		ref, err := manifest.ParseRef(source)
 		if err != nil || ref.Scheme != manifest.RefSchemeFile {
 			return
 		}
 		path, err := opts.RefLocations.ResolveFile(ref, relativeDir)
 		if err == nil {
-			paths[identity] = path
+			paths[logical.Base().String()] = path
 		}
 	}
 	if opts.SourceBinding != nil {
@@ -3037,7 +3045,7 @@ func bundleKnownRefPaths(opts RunOptions) map[string]string {
 		for _, raw := range opts.MemoryBinding.FromRefs {
 			if ref, err := manifest.ParseRef(raw); err == nil && ref.Scheme == manifest.RefSchemeFile {
 				if path, resolveErr := opts.RefLocations.ResolveFile(ref, opts.MemoryBinding.RelativeDir); resolveErr == nil {
-					paths[raw] = path
+					paths[ref.Base().String()] = path
 				}
 			}
 		}
@@ -3099,7 +3107,7 @@ func bindingRelativeDirs(opts RunOptions) []string {
 }
 
 func resolveBundleArtifactPath(ref manifest.Ref, raw string, known map[string]string, outputDir string, locations config.RefLocations, relativeDirs []string) (string, error) {
-	if path := known[raw]; path != "" {
+	if path := known[ref.Base().String()]; path != "" {
 		return path, nil
 	}
 	if ref.Location != "" {
@@ -3299,7 +3307,7 @@ func normalizeLocalMemoryRefs(refs []string) ([]string, error) {
 			}
 			ref.Path = base
 		}
-		out[i] = ref.String()
+		out[i] = ref.Base().String()
 	}
 	return out, nil
 }

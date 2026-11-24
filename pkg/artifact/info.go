@@ -68,6 +68,9 @@ func (s *ProcessStorage) Inspect(ctx context.Context, input string, locations co
 	sandboxRoot, sandboxErr := sandboxfile.Open(ctx, stream)
 	if sandboxErr == nil {
 		defer sandboxRoot.Close()
+		if !ref.Runtime.IsZero() {
+			return nil, errors.New("runtime declaration requires a Snapshot root")
+		}
 		return &Info{
 			Role: RoleSandbox, Raw: append([]byte(nil), sandboxRoot.RuntimeConfig...), Sandbox: sandboxRoot.Portable,
 		}, nil
