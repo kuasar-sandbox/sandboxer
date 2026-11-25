@@ -69,7 +69,7 @@ func exportCmd(args []string) int {
 			fmt.Fprintf(os.Stderr, "export: %v\n", err)
 			return 1
 		}
-		storage, err := artifact.NewProcessStorage(cfg)
+		storage, err := newCLIStorage(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "export: %v\n", err)
 			return 1

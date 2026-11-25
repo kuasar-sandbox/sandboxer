@@ -56,7 +56,7 @@ func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 		t.Fatalf("output %q: %v", stdout, err)
 	}
 	namedDir := filepath.Join(t.TempDir(), "named")
-	namedArgs := []string{"--source-ref", e, "--source-dir", dir, "--disk", "work", "--upload", "--manifest-config", manifestFile, "--to-ref-location", "named=file://" + namedDir}
+	namedArgs := []string{"--source-ref", e, "--source-dir", dir, "--disk", "work", "--upload", "--to-ref-location", "named=file://" + namedDir}
 	rc, stdout, stderr = captureInfoOutput(t, func() int { return exportCmd(namedArgs) })
 	if rc != 0 {
 		t.Fatalf("named export rc %d stderr %s", rc, stderr)
