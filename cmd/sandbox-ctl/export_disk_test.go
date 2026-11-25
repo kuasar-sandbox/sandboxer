@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
@@ -18,6 +21,7 @@ import (
 
 func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 	ctx := context.Background()
+	t.Setenv(config.ManifestConfigEnv, "")
 	t.Setenv("MANIFEST_KEY", strings.Repeat("2d", 32))
 	dir, out := t.TempDir(), t.TempDir()
 	manifestFile := filepath.Join(dir, "manifest.yaml")
@@ -66,7 +70,7 @@ func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	namedRef, err := manifest.ParseRef(namedSpec.Base)
-	if err != nil || namedRef.Location != "named" || namedRef.Digest == "" || namedRef.Scheme != manifest.RefSchemeFile {
+	if err != nil || namedRef.Location != "named" || namedRef.DigestScheme != "manifest" || namedRef.Scheme != manifest.RefSchemeFile || filepath.IsAbs(namedRef.Path) || !strings.HasSuffix(namedRef.Path, ".bundle") {
 		t.Fatalf("named output %q: %v", stdout, err)
 	}
 	if _, err := os.Stat(filepath.Join(namedDir, namedRef.Path)); err != nil {
@@ -75,6 +79,32 @@ func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 	rc, stdout, _ = captureInfoOutput(t, func() int { return exportCmd(append(args, "--resume")) })
 	if rc != 2 || stdout != "" {
 		t.Fatalf("accepted live option: rc=%d stdout=%q", rc, stdout)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := newCLIStorage(&config.ManifestConfig{Crypto: manifestcrypto.Config{Chunk: "aes", Manifest: "aes"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	locations := config.RefLocations{"named": namedDir}
+	path, err = locations.ResolveFile(namedRef, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := storage.OpenFileWithLocations(ctx, path, namedRef, locations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	got := make([]byte, len(body))
+	n, err := stream.ReadAt(ctx, got, 0)
+	if n != len(body) || err != nil && !errors.Is(err, io.EOF) || !bytes.Equal(got, body) {
+		t.Fatalf("named export lost data after source removal: read=%d err=%v", n, err)
 	}
 }
 
@@ -111,7 +141,7 @@ func TestExportDiskCLIRetainsPublishedGraphWithoutManifestConfig(t *testing.T) {
 		case "store":
 			args = append(args, "--upload")
 		case "named":
-			args = append(args, "--upload", "--to-ref-location", "target=file://"+filepath.Join(t.TempDir(), "published"))
+			args = append(args, "--upload", "--to-ref-location", "target=file://"+output)
 		default:
 			args = append(args, "--output", output)
 		}
@@ -129,5 +159,46 @@ func TestExportDiskCLIRetainsPublishedGraphWithoutManifestConfig(t *testing.T) {
 		if _, err := os.Stat(output); !os.IsNotExist(err) {
 			t.Fatalf("all-retained graph created output: %v", err)
 		}
+	}
+}
+
+func TestExportDiskCLIRejectsInvalidNamedDestinationBeforeIO(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	output := filepath.Join(dir, "output")
+	input := filepath.Join(dir, "input")
+	offline := []string{"--source-ref", "file:///missing.sandbox", "--disk", "work", "--manifest-config", filepath.Join(dir, "missing.yaml")}
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		target string
+		want   string
+	}{
+		{"without-upload", append(slices.Clone(offline), "--output", output), "result=file://" + target, "requires --upload"},
+		{"with-output", append(slices.Clone(offline), "--output", output, "--upload"), "result=file://" + target, "one of --output DIR or --upload"},
+		{"live", []string{"--sandbox-id", "live", "--upload"}, "result=file://" + target, "only for offline disk export"},
+		{"checkpoint", []string{"--sandbox-id", "live", "--checkpoint", "saved"}, "result=file://" + target, "only for offline disk export"},
+		{"image-assembly", []string{"--from", "file:///missing.erofs", "--config", "missing.yaml", "--upload"}, "result=file://" + target, "only for offline disk export"},
+		{"offline-checkpoint", append(slices.Clone(offline), "--upload", "--checkpoint", "saved"), "result=file://" + target, "incompatible option: checkpoint"},
+		{"offline-mode", append(slices.Clone(offline), "--upload", "--mode", "bundle"), "result=file://" + target, "incompatible option: mode"},
+		{"offline-resume", append(slices.Clone(offline), "--upload", "--resume"), "result=file://" + target, "incompatible option: resume"},
+		{"empty", append(slices.Clone(offline), "--upload"), "", "want name=file:///absolute/path"},
+		{"invalid-name", append(slices.Clone(offline), "--upload"), "bad/name=file://" + target, "ref location"},
+		{"relative-path", append(slices.Clone(offline), "--upload"), "result=file:relative", "URI must be file:///absolute/path"},
+		{"remote-host", append(slices.Clone(offline), "--upload"), "result=file://host/dir", "URI must be file:///absolute/path"},
+		{"input-conflict", append(slices.Clone(offline), "--upload", "--ref-location", "result=file://"+input), "result=file://" + target, "conflicts with input ref location"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(slices.Clone(tc.args), "--to-ref-location", tc.target)
+			rc, stdout, stderr := captureInfoOutput(t, func() int { return exportCmd(args) })
+			if rc != 2 || stdout != "" || !strings.Contains(stderr, tc.want) {
+				t.Fatalf("export rc=%d stdout=%q stderr=%q, want argument error %q", rc, stdout, stderr, tc.want)
+			}
+			for _, path := range []string{target, output, input} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("invalid export touched %q: %v", path, err)
+				}
+			}
+		})
 	}
 }

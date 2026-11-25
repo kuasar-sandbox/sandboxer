@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -139,31 +141,128 @@ func TestExportDiskUploadsLayersFromBorrowedBundle(t *testing.T) {
 }
 
 func TestExportDiskUploadsLayersToNamedLocation(t *testing.T) {
-	_, storage := manifestPublisherFixture(t)
+	cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
+	storage, err := NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return key, nil })
+	requireDiskIO(t, err)
+	defer storage.Close()
 	reader, rootRef, sourceDir := borrowedDiskBundle(t, storage)
-	targetDir := t.TempDir()
+	targetDir := filepath.Join(t.TempDir(), "published")
+	locations := config.RefLocations{"input": sourceDir}
 	disk, err := reader.ExportDisk(context.Background(), ExportDiskRequest{
 		SourceRef: rootRef, DiskName: "work", Upload: true,
-		ToRefLocation: config.RefLocations{"workspace": targetDir},
+		ToRefLocation: config.RefLocations{"workspace": targetDir}, RefLocations: locations,
 	})
 	requireDiskIO(t, err)
+	if !maps.Equal(locations, config.RefLocations{"input": sourceDir}) {
+		t.Fatalf("export mutated input mappings: %v", locations)
+	}
+	var bundlePath string
 	for _, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
 		ref, err := manifest.ParseRef(raw)
 		requireDiskIO(t, err)
-		if ref.Scheme != manifest.RefSchemeFile || ref.Location != "workspace" || ref.Digest == "" {
+		if ref.Scheme != manifest.RefSchemeFile || ref.Location != "workspace" || ref.DigestScheme != "manifest" || filepath.Ext(ref.Path) != ".bundle" || filepath.Base(ref.Path) != ref.Path {
 			t.Fatalf("named publication returned nonportable ref %q", raw)
 		}
+		if bundlePath != "" && ref.Path != bundlePath {
+			t.Fatalf("selected layers were split across Bundles: %s != %s", ref.Path, bundlePath)
+		}
+		bundlePath = ref.Path
 	}
 	files, err := os.ReadDir(targetDir)
 	requireDiskIO(t, err)
-	if len(files) == 0 {
-		t.Fatal("named publication produced no files")
+	if len(files) != 1 || files[0].Name() != bundlePath {
+		t.Fatalf("named publication must commit exactly one Bundle, got %v", files)
 	}
 	requireDiskIO(t, os.RemoveAll(sourceDir))
-	got := readExportedDisk(t, reader, disk, config.RefLocations{"workspace": targetDir})
+	got := readExportedDisk(t, storage, disk, config.RefLocations{"workspace": targetDir})
 	const page = 4096
 	if !bytes.Equal(got[:page], bytes.Repeat([]byte{'P'}, page)) || !bytes.Equal(got[page:], bytes.Repeat([]byte{'T'}, page)) {
 		t.Fatal("named export lost inherited or written data")
+	}
+}
+
+func TestExportDiskRejectsInvalidNamedDestinationBeforeSourceIO(t *testing.T) {
+	storage, err := NewProcessStorage(nil)
+	requireDiskIO(t, err)
+	defer storage.Close()
+	target := filepath.Join(t.TempDir(), "unused")
+	for _, tc := range []struct {
+		name, want string
+		change     func(*ExportDiskRequest)
+	}{
+		{"without-upload", "with upload", func(r *ExportDiskRequest) { r.Upload, r.OutputDir = false, target }},
+		{"with-output", "exactly one destination", func(r *ExportDiskRequest) { r.OutputDir = target }},
+		{"multiple", "one target", func(r *ExportDiskRequest) { r.ToRefLocation["other"] = target }},
+		{"empty-name", "name is required", func(r *ExportDiskRequest) { r.ToRefLocation = config.RefLocations{"": target} }},
+		{"invalid-name", "location", func(r *ExportDiskRequest) { r.ToRefLocation = config.RefLocations{"../bad": target} }},
+		{"relative-directory", "must be absolute", func(r *ExportDiskRequest) { r.ToRefLocation["out"] = "relative" }},
+		{"conflicting-input", "conflicts with input", func(r *ExportDiskRequest) { r.RefLocations = config.RefLocations{"out": target + "-other"} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := ExportDiskRequest{SourceRef: "/missing-source.sandbox", DiskName: "work", Upload: true, ToRefLocation: config.RefLocations{"out": target}}
+			tc.change(&req)
+			_, err := storage.ExportDisk(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q before opening source", err, tc.want)
+			}
+			if _, err := os.Stat(target); !os.IsNotExist(err) {
+				t.Fatalf("invalid request created target: %v", err)
+			}
+		})
+	}
+}
+
+// A disk exporter must accept sequential checkpoint sources without an
+// identity prepass that consumes the payload before the destination write.
+type singlePassDiskStream struct {
+	sparse.Source
+	next   uint64
+	closed bool
+}
+
+func (s *singlePassDiskStream) ReadAt(ctx context.Context, b []byte, off uint64) (int, error) {
+	if off < s.next {
+		return 0, errors.New("disk source payload was read twice")
+	}
+	n, err := s.Source.ReadAt(ctx, b, off)
+	s.next = off + uint64(n)
+	return n, err
+}
+
+func (s *singlePassDiskStream) RunAt(off, limit uint64) (sparse.Run, error) {
+	run, err := s.Source.RunAt(off, limit)
+	if err != nil {
+		return nil, err
+	}
+	return singlePassDiskRun{Run: run, source: s}, nil
+}
+
+func (s *singlePassDiskStream) Close() error { s.closed = true; return nil }
+
+type singlePassDiskRun struct {
+	sparse.Run
+	source *singlePassDiskStream
+}
+
+func (r singlePassDiskRun) ReadAt(ctx context.Context, b []byte, off uint64) (int, error) {
+	return r.source.ReadAt(ctx, b, r.Offset()+off)
+}
+
+func TestExportDiskNamedDestinationConsumesPayloadOnce(t *testing.T) {
+	cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
+	storage, err := NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return key, nil })
+	requireDiskIO(t, err)
+	defer storage.Close()
+	want := bytes.Repeat([]byte{0x73}, 3*4096)
+	stream := &singlePassDiskStream{Source: publishSource(t, want)}
+	target := config.RefLocations{"out": t.TempDir()}
+	disk, err := storage.publishSavedDisk(context.Background(), ExportDiskRequest{Upload: true, ToRefLocation: target}, []savedDiskLayer{{Stream: stream, size: uint64(len(want))}})
+	requireDiskIO(t, err)
+	if !stream.closed || stream.next != uint64(len(want)) {
+		t.Fatalf("source not fully consumed and closed: %+v", stream)
+	}
+	if !bytes.Equal(readExportedDisk(t, storage, disk, target), want) {
+		t.Fatal("single-pass publication changed payload")
 	}
 }
 
@@ -254,11 +353,23 @@ func TestExportDiskCheckpointPinsOnlyNamedVersion(t *testing.T) {
 	st, err := NewProcessStorageWithCustomerKey(mc, func() ([32]byte, error) { return key, nil })
 	requireDiskIO(t, err)
 	defer st.Close()
-	out, err := st.ExportDisk(ctx, ExportDiskRequest{SourceRef: path, DiskName: "data-b", OutputDir: t.TempDir()})
+	// A later active write cannot change the selected committed version.
+	_, err = f.stores[2].WriteAt(bytes.Repeat([]byte{9}, 4096), 0)
 	requireDiskIO(t, err)
-	b := readExportedDisk(t, st, out)
-	if !bytes.Equal(b[:4096], bytes.Repeat([]byte{3}, 4096)) {
-		t.Fatal("wrong checkpoint disk")
+	for _, named := range []bool{false, true} {
+		target := t.TempDir()
+		req := ExportDiskRequest{SourceRef: path, DiskName: "data-b", OutputDir: target}
+		var locations config.RefLocations
+		if named {
+			locations = config.RefLocations{"out": target}
+			req.OutputDir, req.Upload, req.ToRefLocation = "", true, locations
+		}
+		out, err := st.ExportDisk(ctx, req)
+		requireDiskIO(t, err)
+		b := readExportedDisk(t, st, out, locations)
+		if !bytes.Equal(b[:4096], bytes.Repeat([]byte{3}, 4096)) {
+			t.Fatalf("wrong checkpoint disk or version (named=%t)", named)
+		}
 	}
 	requireDiskIO(t, os.Rename(unselected+".away", unselected))
 	pins, err := st.PinDiffCheckpoints(ctx, f.dir, f.cp)

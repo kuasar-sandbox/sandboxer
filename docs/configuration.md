@@ -248,7 +248,24 @@ sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.d
 sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 ```
 
-Disk export follows the same dependency policy as Sandbox publication. It retains published pure-block `manifest://` references and immutable named file references, including Bundle selectors, without opening their payloads. Local `--output DIR` writes only layers that need materialization into a Bundle; `--upload` writes those layers to the configured Manifest Store; `--upload --to-ref-location NAME=file:///dir` publishes them to the named directory with the same semantics as `sandbox-ctl publish --to-ref-location`. A disk whose complete graph is already published needs no new Bundle, Store write, or named-directory write. The returned `DiskV1` always lists the complete ordered graph and can contain both new and retained references.
+Disk export follows the same dependency policy as Sandbox publication. It retains published pure-block `manifest://` references and immutable named file references, including Bundle selectors, without opening their payloads. The destination controls where layers that still need materialization are written:
+
+| Destination options | Newly materialized layers | Returned references for those layers |
+| --- | --- | --- |
+| `--output DIR` | One local Bundle | Absolute file paths with Bundle member selectors |
+| `--upload` | Configured Manifest Store | `manifest://` references |
+| `--upload --to-ref-location NAME=file:///absolute/dir` | One Bundle in the named directory | Relative Bundle member selectors with `@location:NAME` |
+
+The named destination replaces the Manifest Store destination. Its syntax, validation, and input-location conflict rules match `sandbox-ctl publish --to-ref-location`. The target name also resolves source references with that name; an explicit `--ref-location` for the same name must identify the same directory. A file-only named export can omit Manifest configuration and use `MANIFEST_KEY` for the default Bundle encryption policy. A disk whose complete graph is already published needs no new Bundle, Store write, or named-directory write. The returned `DiskV1` always lists the complete ordered graph and can contain both new and retained references.
+
+`export --to-ref-location` is supported only with `--source-ref E-or-S --disk NAME --upload`; live capture, `--checkpoint`, image assembly with `--from`, and `--output` do not accept it. For example:
+
+```bash
+sandbox-ctl export --source-ref "$PAUSED_E" --disk work \
+  --upload --to-ref-location shared=file:///srv/disk-exports > work.disk.json
+sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json \
+  --ref-location shared=file:///srv/disk-exports
+```
 
 Changing the output directory does not move existing published parents. A receiver needs access to those parents and the corresponding named-location mappings and keys. Source-private checkpoint versions and unpublished Bundle members are materialized so deleting the source sandbox does not invalidate the exported disk. Reading the top layer to determine an otherwise unknown capacity, converting a legacy Sandbox-wrapped disk layer, or compacting a graph that exceeds the layer limit still reads the required sources. To initialize a new disk, supply a JSON object with `kind: disk`, `version: 1`, and either a `diff_template` reference or a size-only creation capacity. Bind can register named locations with `--ref-location NAME=file:///dir`.
 
