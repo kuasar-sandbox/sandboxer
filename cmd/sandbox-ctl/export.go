@@ -63,7 +63,7 @@ func exportCmd(args []string) int {
 			return 2
 		}
 		cfg, err := config.LoadManifestConfig(*manifestPath)
-		if err != nil {
+		if err != nil && !errors.Is(err, manifest.ErrConfigNotProvided) {
 			fmt.Fprintf(os.Stderr, "export: %v\n", err)
 			return 1
 		}

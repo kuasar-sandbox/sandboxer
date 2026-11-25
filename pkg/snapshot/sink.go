@@ -464,9 +464,9 @@ func (s *BundleSink) CommitSnapshot(ctx context.Context, ref, _ string) error {
 	return s.commitRoot(ctx, ref, "snapshot")
 }
 
-// CommitDisk publishes an independent Bundle of ordered pure block layers.
-// Its basename includes every dependency: two disks can share the same top
-// sparse layer while inheriting completely different data.
+// CommitDisk publishes the selected newly materialized pure block layers.
+// Its basename includes every supplied layer. The caller's disk definition
+// also retains any published dependencies that were not copied into this Bundle.
 func (s *BundleSink) CommitDisk(ctx context.Context, refs []string) (string, error) {
 	if len(refs) == 0 {
 		return "", errors.New("disk Bundle requires at least one layer")
