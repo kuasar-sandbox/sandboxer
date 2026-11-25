@@ -36,9 +36,10 @@ type ExportDiskRequest struct {
 
 type savedDiskLayer struct {
 	fetch.Stream
-	// portable is set only if the source was opened directly from the remote
-	// Store and its immutable pure block interpretation is known.
+	// Published pure block layers need no open unless capacity must be read or
+	// the complete view must be compacted. A retained layer may have no Stream.
 	portable string
+	size     uint64
 }
 
 // ExportDisk publishes one named data disk at a committed E or paired S/E
@@ -49,9 +50,6 @@ func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) 
 	}
 	if req.SourceDir != "" && !filepath.IsAbs(req.SourceDir) {
 		return out, errors.New("source directory must be absolute")
-	}
-	if s.ManifestConfig() == nil {
-		return out, errors.New("disk export requires a manifest configuration")
 	}
 	p := newPublisher(s, req.RefLocations, nil, nil)
 	err := p.withDiskTable(ctx, req, func(cfg *config.PortableSandboxConfig, cp *sandboxfile.Checkpoint, scope publishScope) error {
@@ -86,6 +84,9 @@ func (p *Publisher) withDiskTable(ctx context.Context, req ExportDiskRequest, re
 	if req.SourceDir != "" {
 		scope.relativeDir = req.SourceDir
 	}
+	// A borrowed Bundle can select a named parent even when its own carrier
+	// has no path. Keep that selection for the shared publication ref policy.
+	scope.bindings = make(map[string]string)
 	root, scope, err := p.open(ctx, raw, scope)
 	if err != nil {
 		return err
@@ -125,7 +126,9 @@ func (p *Publisher) withDiskTable(ctx context.Context, req ExportDiskRequest, re
 func closeDiskLayers(layers []savedDiskLayer) error {
 	var err error
 	for _, l := range layers {
-		err = errors.Join(err, l.Close())
+		if l.Stream != nil {
+			err = errors.Join(err, l.Close())
+		}
 	}
 	return err
 }
@@ -165,23 +168,35 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 		if e != nil {
 			return layers, e
 		}
-		layers = append(layers, savedDiskLayer{Stream: view})
+		layers = append(layers, savedDiskLayer{Stream: view, size: view.Size()})
 		if view.Info().BaseID != DiffCheckpointBaseID(disk.PortableRootConfig) {
 			return layers, fmt.Errorf("checkpoint disk %s base binding mismatch", disk.Name)
 		}
 	}
 	if disk.Base != "" {
-		for _, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
+		refs := append([]string{disk.Base}, disk.BaseFromRefs...)
+		compact := len(layers)+len(refs) > config.MaxPortableLayerRefs+1
+		for _, raw := range refs {
+			portable, keep, e := p.keepSavedDiskLayer(ctx, raw, scope)
+			if e != nil {
+				return layers, e
+			}
+			if keep && disk.PureBlock && !compact && (len(layers) != 0 || disk.Binding != nil) {
+				layer := savedDiskLayer{portable: portable}
+				if len(layers) == 0 {
+					layer.size = uint64(disk.Binding.SizeBytes)
+				}
+				layers = append(layers, layer)
+				continue
+			}
 			st, _, e := p.open(ctx, raw, scope)
 			if e != nil {
 				return layers, e
 			}
 			ref, _ := manifest.ParseRef(raw)
 			layer := savedDiskLayer{Stream: st}
-			// A manifest name may resolve through a borrowed Bundle, even
-			// when the root was opened by manifest ID rather than file path.
-			if ref.Scheme == manifest.RefSchemeManifest && p.storage.fetcher != nil && scope.fetcher == p.storage.fetcher {
-				layer.portable = raw
+			if keep {
+				layer.portable = portable
 			}
 			if !disk.PureBlock {
 				payload, wrapped, e := sandboxfile.PayloadIfSandbox(ctx, st, ref.Scheme == manifest.RefSchemeFile && filepath.Ext(ref.Path) == ".sandbox")
@@ -193,10 +208,11 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 					layer.portable = ""
 				}
 			}
+			layer.size = layer.Size()
 			layers = append(layers, layer)
 		}
 	}
-	if len(layers) > 0 && disk.Binding != nil && int64(layers[0].Size()) != disk.Binding.SizeBytes {
+	if len(layers) > 0 && disk.Binding != nil && int64(layers[0].size) != disk.Binding.SizeBytes {
 		return layers, errors.New("saved disk capacity does not match bound disk")
 	}
 	if len(layers) == 0 {
@@ -205,14 +221,44 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 	return layers, nil
 }
 
+// keepSavedDiskLayer uses the same provenance selection as E/S publication.
+// A Manifest found in a named Bundle becomes that Bundle's located selector;
+// one found only in a private or borrowed Bundle must still be materialized.
+func (p *Publisher) keepSavedDiskLayer(ctx context.Context, raw string, scope publishScope) (string, bool, error) {
+	portable, keep, err := p.keepPortable(ctx, raw, scope)
+	if err != nil {
+		return "", false, err
+	}
+	if !keep {
+		bound := scopedRef(raw, scope)
+		if bound == raw {
+			return "", false, nil
+		}
+		portable, keep, err = p.keepPortable(ctx, bound, scope)
+		if err != nil || !keep {
+			return "", false, err
+		}
+	}
+	ref, err := manifest.ParseRef(portable)
+	if err != nil {
+		return "", false, err
+	}
+	// DiskV1 is an immutable disk definition. An identityless named file must
+	// be read and published before its bytes can be retained independently.
+	if ref.Scheme == manifest.RefSchemeFile && ref.DigestScheme == "" {
+		return "", false, nil
+	}
+	return portable, true, nil
+}
+
 func (s *ProcessStorage) publishSavedDisk(ctx context.Context, req ExportDiskRequest, layers []savedDiskLayer) (out DiskV1, retErr error) {
 	defer func() { retErr = errors.Join(retErr, closeDiskLayers(layers)) }()
-	size := int64(layers[0].Size())
+	size := int64(layers[0].size)
 	if err := diffstore.ValidateWritableSize(size); err != nil {
 		return DiskV1{}, err
 	}
 	for i, l := range layers[1:] {
-		if l.Size() > uint64(size) {
+		if l.Stream != nil && l.size > uint64(size) {
 			return DiskV1{}, fmt.Errorf("disk parent %d exceeds top logical size", i)
 		}
 	}
@@ -224,7 +270,7 @@ func (s *ProcessStorage) publishSavedDisk(ctx context.Context, req ExportDiskReq
 		for i, l := range layers {
 			all[i] = l.Stream
 		}
-		layers = []savedDiskLayer{{Stream: fetch.NewLayered(all...)}}
+		layers = []savedDiskLayer{{Stream: fetch.NewLayered(all...), size: uint64(size)}}
 	}
 	refs, err := s.deliverDiskLayers(ctx, req, layers)
 	if err != nil {
@@ -236,14 +282,18 @@ func (s *ProcessStorage) publishSavedDisk(ctx context.Context, req ExportDiskReq
 func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRequest, layers []savedDiskLayer) (refs []string, retErr error) {
 	refs = make([]string, 0, len(layers))
 	if req.Upload {
-		pub, err := NewManifestPublisher(s, s.ManifestConfig(), req.RefLocations, nil)
-		if err != nil {
-			return nil, err
-		}
+		var pub *Publisher
 		defer func() { retErr = errors.Join(retErr, pub.Close()) }()
 		for _, l := range layers {
 			ref := l.portable
 			if ref == "" {
+				var err error
+				if pub == nil {
+					pub, err = NewManifestPublisher(s, s.ManifestConfig(), req.RefLocations, nil)
+					if err != nil {
+						return nil, err
+					}
+				}
 				ref, err = pub.target.Put(ctx, RoleOverlay, l.Stream)
 				if err != nil {
 					return nil, err
@@ -253,31 +303,51 @@ func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRe
 		}
 		return refs, nil
 	}
+	// A local Bundle contains only the newly materialized layers. The returned
+	// DiskV1 remains the complete ordered graph, including unchanged parents.
+	var materialized []string
+	var materializedIndexes []int
+	var bundle *snapshot.BundleSink
+	defer func() {
+		if bundle != nil {
+			retErr = errors.Join(retErr, bundle.Close())
+		}
+	}()
 	dir, err := filepath.Abs(req.OutputDir)
 	if err != nil {
 		return nil, err
 	}
-	if err = ensurePublishDirectory(dir); err != nil {
-		return nil, err
-	}
-	bundle, err := snapshot.NewBundleSink(ctx, dir, "disk", s.ManifestConfig(), s.CustomerKeyFunc(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { retErr = errors.Join(retErr, bundle.Close()) }()
-	for _, l := range layers {
+	for i, l := range layers {
+		if l.portable != "" {
+			refs = append(refs, l.portable)
+			continue
+		}
+		if bundle == nil {
+			if err = ensurePublishDirectory(dir); err != nil {
+				return nil, err
+			}
+			bundle, err = snapshot.NewBundleSink(ctx, dir, "disk", s.ManifestConfig(), s.CustomerKeyFunc(), nil)
+			if err != nil {
+				return nil, err
+			}
+		}
 		r, _, e := bundle.AbsorbOverlaySource(ctx, l.Stream)
 		if e != nil {
 			return nil, e
 		}
 		refs = append(refs, r)
+		materialized = append(materialized, r)
+		materializedIndexes = append(materializedIndexes, i)
 	}
-	path, err := bundle.CommitDisk(ctx, refs)
+	if bundle == nil {
+		return refs, nil
+	}
+	path, err := bundle.CommitDisk(ctx, materialized)
 	if err != nil {
 		return nil, err
 	}
-	for i, r := range refs {
-		sel, _ := manifest.ParseRef(r)
+	for _, i := range materializedIndexes {
+		sel, _ := manifest.ParseRef(refs[i])
 		refs[i] = (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path, DigestScheme: "manifest", Digest: sel.Path}).String()
 	}
 	return refs, nil

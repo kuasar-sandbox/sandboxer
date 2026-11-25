@@ -26,14 +26,18 @@ func requireDiskIO(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
-func readExportedDisk(t *testing.T, st *ProcessStorage, d DiskV1) []byte {
+func readExportedDisk(t *testing.T, st *ProcessStorage, d DiskV1, locations ...config.RefLocations) []byte {
 	t.Helper()
 	ctx := context.Background()
 	requireDiskIO(t, d.Validate())
+	var loc config.RefLocations
+	if len(locations) > 0 {
+		loc = locations[0]
+	}
 	var streams []fetch.Stream
 	for _, raw := range append([]string{d.Base}, d.BaseFromRefs...) {
 
-		stream, _, err := newPublisher(st, nil, nil, nil).open(ctx, raw, publishScope{})
+		stream, _, err := newPublisher(st, loc, nil, nil).open(ctx, raw, publishScope{})
 		requireDiskIO(t, err)
 		streams = append(streams, stream)
 	}
@@ -76,8 +80,9 @@ func borrowedDiskBundle(t *testing.T, storage *ProcessStorage) (*ProcessStorage,
 	topRef, _, err := sink.AbsorbOverlay(ctx, bytes.NewReader(top), []sparse.Extent{{Offset: 0, Size: page}})
 	requireDiskIO(t, err)
 	_, portable := publishPortable(t, "")
+	portable.Version = 2
 	portable.Boot.Disks = []config.PortableDiskConfig{{
-		Name: "work", PortableRootConfig: config.PortableRootConfig{Base: topRef, BaseFromRefs: []string{parentRef}},
+		Name: "work", PureBlock: true, PortableRootConfig: config.PortableRootConfig{Base: topRef, BaseFromRefs: []string{parentRef}},
 	}}
 	portable.Mounts = append(portable.Mounts, config.MountConfig{Type: "disk", Source: "work", Target: "/work"})
 	body, err := config.MarshalPortableSandboxConfig(portable)

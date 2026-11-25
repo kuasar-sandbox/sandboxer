@@ -225,7 +225,9 @@ sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.d
 sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 ```
 
-本地输出为包含所需块层的 Bundle。跨宿主交付可用 `--upload` 发布内容，并向两端提供相应的 Manifest 配置。初始化新盘时，`--disk-spec` 也可读取含 `kind: disk`、`version: 1` 以及 `diff_template` 或 size-only 创建容量的 JSON。绑定可以通过 `--ref-location NAME=file:///dir` 提供命名位置。
+单盘导出与 Sandbox 发布遵循相同的依赖规则。已发布的纯块层 `manifest://` 引用，以及带不可变身份的具名文件引用（包括 Bundle 选择器），会原样保留，不打开其 payload。本地 `--output DIR` 只将需要物化的层写入 Bundle；`--upload` 将这些层写入配置的 Manifest Store。完整盘图已经发布时，不新建 Bundle，也不写入 Store。返回的 `DiskV1` 始终列全有序层图，可以同时包含新生成和原样保留的引用。
+
+更换输出目录不会搬迁已经发布的父层。接收端仍需能够访问这些父层，并提供相应的命名位置映射和密钥。源沙箱私有的 checkpoint 版本和未发布 Bundle 成员需要物化，清理源沙箱后导出的盘仍可使用。缺少已记录容量时读取顶层元数据、转换旧式 Sandbox 包装的磁盘层，或在层数超限时合并完整视图，仍会读取所需来源。初始化新盘时，`--disk-spec` 也可读取含 `kind: disk`、`version: 1` 以及 `diff_template` 或 size-only 创建容量的 JSON。绑定可以通过 `--ref-location NAME=file:///dir` 提供命名位置。
 
 ### 工作负载字段
 

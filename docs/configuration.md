@@ -248,7 +248,9 @@ sandbox-ctl export --source-ref "$PAUSED_E" --disk work --output "$OUT" > work.d
 sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 ```
 
-Local delivery creates a Bundle containing the required block layers. For delivery across hosts, use `--upload` with the appropriate Manifest configuration on both ends. To initialize a new disk, supply a JSON object with `kind: disk`, `version: 1`, and either a `diff_template` reference or a size-only creation capacity. Bind can register named locations with `--ref-location NAME=file:///dir`.
+Disk export follows the same dependency policy as Sandbox publication. It retains published pure-block `manifest://` references and immutable named file references, including Bundle selectors, without opening their payloads. Local `--output DIR` writes only layers that need materialization into a Bundle; `--upload` writes those layers to the configured Manifest Store. A disk whose complete graph is already published needs no new Bundle or Store write. The returned `DiskV1` always lists the complete ordered graph and can contain both new and retained references.
+
+Changing the output directory does not move existing published parents. A receiver needs access to those parents and the corresponding named-location mappings and keys. Source-private checkpoint versions and unpublished Bundle members are materialized so deleting the source sandbox does not invalidate the exported disk. Reading the top layer to determine an otherwise unknown capacity, converting a legacy Sandbox-wrapped disk layer, or compacting a graph that exceeds the layer limit still reads the required sources. To initialize a new disk, supply a JSON object with `kind: disk`, `version: 1`, and either a `diff_template` reference or a size-only creation capacity. Bind can register named locations with `--ref-location NAME=file:///dir`.
 
 ### Workload fields
 

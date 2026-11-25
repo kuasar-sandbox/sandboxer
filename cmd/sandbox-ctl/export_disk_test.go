@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -57,5 +58,56 @@ func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 	rc, stdout, _ = captureInfoOutput(t, func() int { return exportCmd(append(args, "--resume")) })
 	if rc != 2 || stdout != "" {
 		t.Fatalf("accepted live option: rc=%d stdout=%q", rc, stdout)
+	}
+}
+
+func TestExportDiskCLIRetainsPublishedGraphWithoutManifestConfig(t *testing.T) {
+	t.Setenv(config.ManifestConfigEnv, "")
+	t.Setenv("MANIFEST_KEY", "")
+	dir := t.TempDir()
+	sink := snapshot.NewFileSink(dir, "source", nil, false, nil)
+	defer sink.Close()
+	c := testRunFromPortable(t)
+	c.Version = 2
+	c.Boot.Root = config.PortableRootConfig{Base: "self"}
+	c.Boot.DiskCapabilities = &config.DiskCapabilities{SlotV1: true}
+	base := "manifest://" + strings.Repeat("a", 64)
+	parents := []string{"file://parent.bundle@manifest:" + strings.Repeat("b", 64) + "@location:offline"}
+	c.Boot.Disks = []config.PortableDiskConfig{{
+		Name: "work", PureBlock: true, Slot: &config.DiskSlotConfig{},
+		Binding:            &config.SlotBinding{ID: "binding", SourceID: "source", SizeBytes: 4096},
+		PortableRootConfig: config.PortableRootConfig{Base: base, BaseFromRefs: parents},
+	}}
+	c.Mounts = []config.MountConfig{{Type: "disk", Source: "work", Target: "/data"}}
+	ctx := context.Background()
+	ref, path, err := sink.AbsorbSandbox(ctx, runFromLogical(t, c))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sink.CommitSandbox(ctx, ref, path); err != nil {
+		t.Fatal(err)
+	}
+	for _, upload := range []bool{false, true} {
+		args := []string{"--source-ref", ref, "--source-dir", dir, "--disk", "work"}
+		output := filepath.Join(t.TempDir(), "unused")
+		if upload {
+			args = append(args, "--upload")
+		} else {
+			args = append(args, "--output", output)
+		}
+		rc, stdout, stderr := captureInfoOutput(t, func() int { return exportCmd(args) })
+		if rc != 0 {
+			t.Fatalf("upload=%t: export rc %d stderr %s", upload, rc, stderr)
+		}
+		var spec artifact.DiskV1
+		if err = json.Unmarshal([]byte(stdout), &spec); err != nil {
+			t.Fatal(err)
+		}
+		if spec.Base != base || !slices.Equal(spec.BaseFromRefs, parents) || spec.Size == nil || *spec.Size != 4096 {
+			t.Fatalf("published graph changed: %s", stdout)
+		}
+		if _, err := os.Stat(output); !os.IsNotExist(err) {
+			t.Fatalf("all-retained graph created output: %v", err)
+		}
 	}
 }

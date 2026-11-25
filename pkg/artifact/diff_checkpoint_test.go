@@ -609,4 +609,33 @@ func TestMaterializeCheckpointOnMaximumDepthPureDisk(t *testing.T) {
 	if buf[0] != 'T' || buf[4096] != 'B' {
 		t.Fatal("lost written or inherited blocks")
 	}
+	// Single-disk export also has to compact this complete graph, even when
+	// ordinary publication would retain its already-located immutable layers.
+	for i, raw := range refs {
+		ref, err := manifest.ParseRef(raw)
+		requireDiskIO(t, err)
+		ref.Location = "parents"
+		refs[i] = ref.String()
+	}
+	d.Base, d.BaseFromRefs = refs[0], refs[1:]
+	saved, err = sandboxfile.BuildCheckpointSource(ctx, f.cfg, f.cp)
+	requireDiskIO(t, err)
+	_, path, err = sink.AbsorbSandbox(ctx, saved)
+	requireDiskIO(t, err)
+	mc, key := sourceBundleConfig(manifestcrypto.LocalOff)
+	exporter, err := NewProcessStorageWithCustomerKey(mc, func() ([32]byte, error) { return key, nil })
+	requireDiskIO(t, err)
+	defer exporter.Close()
+	disk, err := exporter.ExportDisk(ctx, ExportDiskRequest{
+		SourceRef: path, DiskName: d.Name, OutputDir: t.TempDir(),
+		RefLocations: config.RefLocations{"parents": f.dir},
+	})
+	requireDiskIO(t, err)
+	if len(disk.BaseFromRefs) != 0 {
+		t.Fatalf("maximum-depth export was not compacted: %+v", disk)
+	}
+	data := readExportedDisk(t, exporter, disk)
+	if data[0] != 'T' || data[4096] != 'B' {
+		t.Fatal("disk export lost written or inherited blocks during compaction")
+	}
 }

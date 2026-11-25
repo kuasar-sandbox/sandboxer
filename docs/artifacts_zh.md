@@ -780,6 +780,8 @@ freeze前完整校验，在目标目录尚未拥有依赖时物化，避免产�
 root carrier物化为`.image`;只有需要作为独立dependency保存的root/data writable layer物化为
 `.overlay`. 当前root writable top由Sandbox E payload承载,不生成第二份`.overlay`.
 
+单盘导出对已发布纯块层使用相同的来源规则。`DiskV1` 保留这些层的不可变引用，并按顺序列出新物化的层；本地输出 Bundle 只包含新层。已发布父层仍位于原位置，因此接收端仍需相应的位置和密钥。源沙箱清理前，私有 checkpoint 版本和未发布 Bundle 成员需要物化。CLI 用法，以及容量、旧式格式和层数限制所需的来源读取，见[磁盘导出与绑定](configuration_zh.md#延迟绑定与子目录挂载)。
+
 <a id="checkpoint-history"></a>
 
 ### 托管 checkpoint 历史合并与选择性清理
