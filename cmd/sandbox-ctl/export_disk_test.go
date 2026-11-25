@@ -55,6 +55,23 @@ func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 	if err != nil || !filepath.IsAbs(r.Path) || r.DigestScheme != "manifest" || *spec.Size != int64(len(body)) {
 		t.Fatalf("output %q: %v", stdout, err)
 	}
+	namedDir := filepath.Join(t.TempDir(), "named")
+	namedArgs := []string{"--source-ref", e, "--source-dir", dir, "--disk", "work", "--upload", "--manifest-config", manifestFile, "--to-ref-location", "named=file://" + namedDir}
+	rc, stdout, stderr = captureInfoOutput(t, func() int { return exportCmd(namedArgs) })
+	if rc != 0 {
+		t.Fatalf("named export rc %d stderr %s", rc, stderr)
+	}
+	var namedSpec artifact.DiskV1
+	if err = json.Unmarshal([]byte(stdout), &namedSpec); err != nil {
+		t.Fatal(err)
+	}
+	namedRef, err := manifest.ParseRef(namedSpec.Base)
+	if err != nil || namedRef.Location != "named" || namedRef.Digest == "" || namedRef.Scheme != manifest.RefSchemeFile {
+		t.Fatalf("named output %q: %v", stdout, err)
+	}
+	if _, err := os.Stat(filepath.Join(namedDir, namedRef.Path)); err != nil {
+		t.Fatalf("named output file missing: %v", err)
+	}
 	rc, stdout, _ = captureInfoOutput(t, func() int { return exportCmd(append(args, "--resume")) })
 	if rc != 2 || stdout != "" {
 		t.Fatalf("accepted live option: rc=%d stdout=%q", rc, stdout)
