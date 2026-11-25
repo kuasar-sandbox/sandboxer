@@ -38,8 +38,8 @@ func exportDiskSource(t *testing.T, sink snapshot.ArtifactSink, disk config.Port
 }
 
 func TestExportDiskRetainsPublishedGraphWithoutStorageAccess(t *testing.T) {
-	for _, upload := range []bool{false, true} {
-		t.Run(fmt.Sprintf("upload=%t", upload), func(t *testing.T) {
+	for _, destination := range []string{"local", "store", "named"} {
+		t.Run(destination, func(t *testing.T) {
 			ctx := context.Background()
 			storage, err := NewProcessStorage(nil)
 			requireDiskIO(t, err)
@@ -63,8 +63,11 @@ func TestExportDiskRetainsPublishedGraphWithoutStorageAccess(t *testing.T) {
 			})
 			output := filepath.Join(t.TempDir(), "unused")
 			req := ExportDiskRequest{SourceRef: ref, SourceDir: sourceDir, DiskName: "work", OutputDir: output}
-			if upload {
+			if destination != "local" {
 				req.OutputDir, req.Upload = "", true
+			}
+			if destination == "named" {
+				req.ToRefLocation = config.RefLocations{"output": output}
 			}
 			disk, err := reader.ExportDisk(ctx, req)
 			requireDiskIO(t, err)
@@ -83,6 +86,15 @@ func TestExportDiskRetainsPublishedGraphWithoutStorageAccess(t *testing.T) {
 }
 
 func TestExportDiskMaterializesOnlyPrivateLayers(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		t.Run(fmt.Sprintf("named=%t", named), func(t *testing.T) {
+			testExportDiskMaterializesOnlyPrivateLayers(t, named)
+		})
+	}
+}
+
+func testExportDiskMaterializesOnlyPrivateLayers(t *testing.T, named bool) {
+	t.Helper()
 	ctx := context.Background()
 	cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
 	storage, err := NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return key, nil })
@@ -100,14 +112,23 @@ func TestExportDiskMaterializesOnlyPrivateLayers(t *testing.T) {
 	ref, _ := exportDiskSource(t, sink, config.PortableDiskConfig{Name: "work", PureBlock: true, PortableRootConfig: config.PortableRootConfig{Base: top, BaseFromRefs: []string{parent}}})
 	// The exporter has no mapping for the immutable parent. Only the private
 	// top can be opened; its metadata provides capacity for this ordinary disk.
-	disk, err := storage.ExportDisk(ctx, ExportDiskRequest{SourceRef: ref, SourceDir: sourceDir, DiskName: "work", OutputDir: output})
+	req := ExportDiskRequest{SourceRef: ref, SourceDir: sourceDir, DiskName: "work", OutputDir: output}
+	locations := config.RefLocations{"parents": parentDir}
+	if named {
+		req.OutputDir, req.Upload = "", true
+		req.ToRefLocation = config.RefLocations{"output": output}
+		locations["output"] = output
+	}
+	disk, err := storage.ExportDisk(ctx, req)
 	requireDiskIO(t, err)
 	if !slices.Equal(disk.BaseFromRefs, []string{parent}) {
 		t.Fatalf("retained parent changed: %+v", disk)
 	}
 	base, err := manifest.ParseRef(disk.Base)
 	requireDiskIO(t, err)
-	if filepath.Dir(base.Path) != output || base.DigestScheme != "manifest" {
+	path, err := locations.ResolveFile(base, "")
+	requireDiskIO(t, err)
+	if filepath.Dir(path) != output || base.DigestScheme != "manifest" || named && base.Location != "output" {
 		t.Fatalf("new top was not published to the selected output: %s", disk.Base)
 	}
 	files, err := os.ReadDir(output)
@@ -116,7 +137,7 @@ func TestExportDiskMaterializesOnlyPrivateLayers(t *testing.T) {
 		t.Fatalf("materialized %d files, want only the private top Bundle", len(files))
 	}
 	requireDiskIO(t, os.RemoveAll(sourceDir))
-	got := readExportedDisk(t, storage, disk, config.RefLocations{"parents": parentDir})
+	got := readExportedDisk(t, storage, disk, locations)
 	want := bytes.Clone(data)
 	copy(want, bytes.Repeat([]byte{'P'}, page))
 	if !bytes.Equal(got, want) {

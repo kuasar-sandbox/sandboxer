@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -32,6 +33,9 @@ type ExportDiskRequest struct {
 	RefLocations config.RefLocations
 	OutputDir    string
 	Upload       bool
+	// ToRefLocation selects one named Bundle destination instead of the
+	// Manifest Store when Upload is true. Values are absolute directories.
+	ToRefLocation config.RefLocations
 }
 
 type savedDiskLayer struct {
@@ -47,6 +51,32 @@ type savedDiskLayer struct {
 func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) (out DiskV1, retErr error) {
 	if req.SourceRef == "" || req.DiskName == "" || req.Upload == (req.OutputDir != "") {
 		return out, errors.New("disk export requires source, disk name and exactly one destination")
+	}
+	if len(req.ToRefLocation) > 1 || len(req.ToRefLocation) != 0 && !req.Upload {
+		return out, errors.New("disk export accepts one target ref location with upload")
+	}
+	for name, directory := range req.ToRefLocation {
+		if name == "" {
+			return out, errors.New("disk export target ref location name is required")
+		}
+		probe := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: "probe.bundle", Location: name}
+		if err := probe.Validate(); err != nil {
+			return out, err
+		}
+		if !filepath.IsAbs(directory) {
+			return out, fmt.Errorf("publish location directory must be absolute: %q", directory)
+		}
+		directory = filepath.Clean(directory)
+		if previous, exists := req.RefLocations[name]; exists && previous != directory {
+			return out, fmt.Errorf("publish target ref location %q conflicts with input ref location: %q != %q", name, directory, previous)
+		}
+		// The target can also resolve source refs, as in publish. Keep the
+		// caller's input mappings unchanged and defer all destination I/O.
+		req.RefLocations = maps.Clone(req.RefLocations)
+		if req.RefLocations == nil {
+			req.RefLocations = make(config.RefLocations)
+		}
+		req.RefLocations[name] = directory
 	}
 	if req.SourceDir != "" && !filepath.IsAbs(req.SourceDir) {
 		return out, errors.New("source directory must be absolute")
@@ -281,7 +311,7 @@ func (s *ProcessStorage) publishSavedDisk(ctx context.Context, req ExportDiskReq
 
 func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRequest, layers []savedDiskLayer) (refs []string, retErr error) {
 	refs = make([]string, 0, len(layers))
-	if req.Upload {
+	if req.Upload && len(req.ToRefLocation) == 0 {
 		var pub *Publisher
 		defer func() { retErr = errors.Join(retErr, pub.Close()) }()
 		for _, l := range layers {
@@ -303,8 +333,9 @@ func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRe
 		}
 		return refs, nil
 	}
-	// A local Bundle contains only the newly materialized layers. The returned
-	// DiskV1 remains the complete ordered graph, including unchanged parents.
+	// A local or named Bundle contains only newly materialized layers. Ingest
+	// each stream once so sequential checkpoint sources remain usable.
+	// DiskV1 retains the complete ordered graph, including unchanged parents.
 	var materialized []string
 	var materializedIndexes []int
 	var bundle *snapshot.BundleSink
@@ -313,7 +344,11 @@ func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRe
 			retErr = errors.Join(retErr, bundle.Close())
 		}
 	}()
-	dir, err := filepath.Abs(req.OutputDir)
+	directory, location := req.OutputDir, ""
+	for name, target := range req.ToRefLocation {
+		directory, location = target, name
+	}
+	dir, err := filepath.Abs(directory)
 	if err != nil {
 		return nil, err
 	}
@@ -346,9 +381,12 @@ func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRe
 	if err != nil {
 		return nil, err
 	}
+	if location != "" {
+		path = filepath.Base(path)
+	}
 	for _, i := range materializedIndexes {
 		sel, _ := manifest.ParseRef(refs[i])
-		refs[i] = (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path, DigestScheme: "manifest", Digest: sel.Path}).String()
+		refs[i] = (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path, DigestScheme: "manifest", Digest: sel.Path, Location: location}).String()
 	}
 	return refs, nil
 }

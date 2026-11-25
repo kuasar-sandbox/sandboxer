@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -35,14 +36,15 @@ func exportCmd(args []string) int {
 	from := fs.String("from", "", "flattened EROFS reference for image-to-Sandbox-E assembly")
 	configPath := fs.String("config", "", "assembly sandbox.yaml path(s), ':'-separated (or SANDBOX_CONFIG)")
 	outDir := fs.String("output", "", "local output directory")
-	upload := fs.Bool("upload", false, "upload artifacts to the manifest store")
+	upload := fs.Bool("upload", false, "publish artifacts; offline disk --to-ref-location overrides the manifest store")
 	mode := fs.String("mode", ctl.SnapshotModeLocal, "local carrier: local|bundle")
 	resume := fs.Bool("resume", false, "live export: keep the sandbox running")
 	runRoot := fs.String("run-root", "", "tmpfs run root (or SANDBOX_RUN_ROOT; default /run/sandbox)")
 	manifestPath := fs.String("manifest-config", "", "storage config YAML (or MANIFEST_CONFIG)")
 	timeoutS := fs.Int("timeout", 0, "seconds to wait for export_done (0 = indefinite)")
 	refLocations := config.RefLocations{}
-	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
+	fs.Var(refLocations, "ref-location", "trusted input ref location name=file:///absolute/path (repeatable)")
+	toRefLocation := fs.String("to-ref-location", "", "offline disk export with --upload: publish to name=file:///absolute/path instead of the manifest store")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -50,24 +52,42 @@ func exportCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "export: unexpected positional arguments")
 		return 2
 	}
+	toRefLocationSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "to-ref-location" {
+			toRefLocationSet = true
+		}
+	})
 	if *sourceRef != "" || *sourceDir != "" || *diskName != "" {
-		allowed := map[string]bool{"source-ref": true, "source-dir": true, "disk": true, "upload": true, "output": true, "manifest-config": true, "json": true, "ref-location": true, "timeout": true}
+		allowed := map[string]bool{"source-ref": true, "source-dir": true, "disk": true, "upload": true, "output": true, "manifest-config": true, "json": true, "ref-location": true, "to-ref-location": true, "timeout": true}
 		var incompatible string
 		fs.Visit(func(f *flag.Flag) {
 			if !allowed[f.Name] {
 				incompatible = f.Name
 			}
 		})
-		if incompatible != "" || *diskName == "" || *sourceRef == "" || *upload == (*outDir != "") || *timeoutS < 0 {
-			fmt.Fprintln(os.Stderr, "export: offline disk export requires --source-ref REF --disk NAME and one of --output DIR or --upload; incompatible option:", incompatible)
+		if incompatible != "" || *diskName == "" || *sourceRef == "" || *upload == (*outDir != "") || *timeoutS < 0 || toRefLocationSet && !*upload {
+			fmt.Fprintln(os.Stderr, "export: offline disk export requires --source-ref REF --disk NAME and one of --output DIR or --upload; --to-ref-location requires --upload; incompatible option:", incompatible)
 			return 2
+		}
+		var target config.RefLocations
+		if toRefLocationSet {
+			name, directory, err := parsePublishTarget(*toRefLocation, refLocations)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "export: %v\n", err)
+				return 2
+			}
+			target = config.RefLocations{name: directory}
 		}
 		cfg, err := config.LoadManifestConfig(*manifestPath)
 		if err != nil && !errors.Is(err, manifest.ErrConfigNotProvided) {
 			fmt.Fprintf(os.Stderr, "export: %v\n", err)
 			return 1
 		}
-		storage, err := artifact.NewProcessStorage(cfg)
+		if toRefLocationSet && cfg == nil {
+			cfg = &config.ManifestConfig{Crypto: manifestcrypto.Config{Chunk: "aes", Manifest: "aes"}}
+		}
+		storage, err := newCLIStorage(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "export: %v\n", err)
 			return 1
@@ -78,7 +98,7 @@ func exportCmd(args []string) int {
 			ctx, cancel = context.WithTimeout(ctx, time.Duration(*timeoutS)*time.Second)
 			defer cancel()
 		}
-		result, err := storage.ExportDisk(ctx, artifact.ExportDiskRequest{SourceRef: *sourceRef, SourceDir: *sourceDir, DiskName: *diskName, OutputDir: *outDir, Upload: *upload, RefLocations: refLocations})
+		result, err := storage.ExportDisk(ctx, artifact.ExportDiskRequest{SourceRef: *sourceRef, SourceDir: *sourceDir, DiskName: *diskName, OutputDir: *outDir, Upload: *upload, RefLocations: refLocations, ToRefLocation: target})
 		if err = errors.Join(err, storage.Close()); err == nil {
 			err = json.NewEncoder(os.Stdout).Encode(result)
 		}
@@ -101,6 +121,10 @@ func exportCmd(args []string) int {
 			refLocationSet = true
 		}
 	})
+	if toRefLocationSet {
+		fmt.Fprintln(os.Stderr, "export: --to-ref-location is supported only for offline disk export with --upload")
+		return 2
+	}
 	if *mode != ctl.SnapshotModeLocal && *mode != ctl.SnapshotModeBundle {
 		fmt.Fprintf(os.Stderr, "export: --mode %q invalid (want local|bundle)\n", *mode)
 		return 2
@@ -150,7 +174,7 @@ func exportCmd(args []string) int {
 		return 2
 	}
 	if *from == "" && (manifestSet || refLocationSet) {
-		fmt.Fprintln(os.Stderr, "export: live mode uses the running sandbox storage/ref bindings; --manifest-config and --ref-location are assembly-only")
+		fmt.Fprintln(os.Stderr, "export: live mode uses the running sandbox storage/ref bindings; --manifest-config and --ref-location are offline-only")
 		return 2
 	}
 	if *outDir != "" {

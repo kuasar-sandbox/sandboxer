@@ -72,20 +72,14 @@ func publishArtifactCmd(command string, args []string) int {
 	}
 	var targetName, targetDirectory string
 	if *toRefLocation != "" {
-		targets := config.RefLocations{}
-		if err := targets.Set(*toRefLocation); err != nil {
+		targetName, targetDirectory, err = parsePublishTarget(*toRefLocation, refLocations)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 2
 		}
-		for targetName, targetDirectory = range targets {
-			if inputDirectory, exists := refLocations[targetName]; exists && inputDirectory != targetDirectory {
-				fmt.Fprintf(os.Stderr, "publish target ref location %q conflicts with input ref location: %q != %q\n", targetName, targetDirectory, inputDirectory)
-				return 2
-			}
-			// Preserve the existing behavior where a target location also resolves
-			// source refs bearing that name when no separate input mapping exists.
-			refLocations[targetName] = targetDirectory
-		}
+		// A target location also resolves source refs bearing that name when no
+		// separate input mapping exists.
+		refLocations[targetName] = targetDirectory
 	}
 	manifestCfg, loadErr := config.LoadManifestConfig(*manifestPath)
 	if loadErr != nil {
@@ -150,4 +144,19 @@ func publishArtifactCmd(command string, args []string) int {
 		return 1
 	}
 	return exitCode
+}
+
+// parsePublishTarget gives disk export and publication the same target syntax
+// and rejects conflicting input mappings before either command opens a source.
+func parsePublishTarget(raw string, inputs config.RefLocations) (name, directory string, err error) {
+	target := config.RefLocations{}
+	if err = target.Set(raw); err != nil {
+		return "", "", err
+	}
+	for name, directory = range target {
+		if inputDirectory, exists := inputs[name]; exists && inputDirectory != directory {
+			return "", "", fmt.Errorf("publish target ref location %q conflicts with input ref location: %q != %q", name, directory, inputDirectory)
+		}
+	}
+	return name, directory, nil
 }
