@@ -87,17 +87,20 @@ func TestExportDiskCLIRetainsPublishedGraphWithoutManifestConfig(t *testing.T) {
 	if err = sink.CommitSandbox(ctx, ref, path); err != nil {
 		t.Fatal(err)
 	}
-	for _, upload := range []bool{false, true} {
+	for _, mode := range []string{"local", "store", "named"} {
 		args := []string{"--source-ref", ref, "--source-dir", dir, "--disk", "work"}
 		output := filepath.Join(t.TempDir(), "unused")
-		if upload {
+		switch mode {
+		case "store":
 			args = append(args, "--upload")
-		} else {
+		case "named":
+			args = append(args, "--upload", "--to-ref-location", "target=file://"+filepath.Join(t.TempDir(), "published"))
+		default:
 			args = append(args, "--output", output)
 		}
 		rc, stdout, stderr := captureInfoOutput(t, func() int { return exportCmd(args) })
 		if rc != 0 {
-			t.Fatalf("upload=%t: export rc %d stderr %s", upload, rc, stderr)
+			t.Fatalf("mode=%s: export rc %d stderr %s", mode, rc, stderr)
 		}
 		var spec artifact.DiskV1
 		if err = json.Unmarshal([]byte(stdout), &spec); err != nil {

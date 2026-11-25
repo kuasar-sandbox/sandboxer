@@ -26,12 +26,13 @@ var (
 )
 
 type ExportDiskRequest struct {
-	SourceRef    string
-	SourceDir    string
-	DiskName     string
-	RefLocations config.RefLocations
-	OutputDir    string
-	Upload       bool
+	SourceRef     string
+	SourceDir     string
+	DiskName      string
+	RefLocations  config.RefLocations
+	OutputDir     string
+	Upload        bool
+	ToRefLocation config.RefLocations
 }
 
 type savedDiskLayer struct {
@@ -45,8 +46,19 @@ type savedDiskLayer struct {
 // ExportDisk publishes one named data disk at a committed E or paired S/E
 // point. It never takes an online checkpoint or consumes an existing one.
 func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) (out DiskV1, retErr error) {
-	if req.SourceRef == "" || req.DiskName == "" || req.Upload == (req.OutputDir != "") {
-		return out, errors.New("disk export requires source, disk name and exactly one destination")
+	if req.SourceRef == "" || req.DiskName == "" || req.Upload == (req.OutputDir != "") || len(req.ToRefLocation) > 1 || len(req.ToRefLocation) != 0 && (!req.Upload || req.OutputDir != "") {
+		return out, errors.New("disk export requires source, disk name and exactly one destination; named locations require upload")
+	}
+	// A target location also resolves source refs with the same name, matching
+	// publish's existing input/output location semantics.
+	if len(req.ToRefLocation) != 0 && req.RefLocations == nil {
+		req.RefLocations = make(config.RefLocations)
+	}
+	for name, directory := range req.ToRefLocation {
+		if previous, exists := req.RefLocations[name]; exists && previous != directory {
+			return out, fmt.Errorf("publish target ref location %q conflicts with input ref location: %q != %q", name, directory, previous)
+		}
+		req.RefLocations[name] = directory
 	}
 	if req.SourceDir != "" && !filepath.IsAbs(req.SourceDir) {
 		return out, errors.New("source directory must be absolute")
@@ -283,13 +295,23 @@ func (s *ProcessStorage) deliverDiskLayers(ctx context.Context, req ExportDiskRe
 	refs = make([]string, 0, len(layers))
 	if req.Upload {
 		var pub *Publisher
-		defer func() { retErr = errors.Join(retErr, pub.Close()) }()
+		defer func() {
+			if pub != nil {
+				retErr = errors.Join(retErr, pub.Close())
+			}
+		}()
 		for _, l := range layers {
 			ref := l.portable
 			if ref == "" {
 				var err error
 				if pub == nil {
-					pub, err = NewManifestPublisher(s, s.ManifestConfig(), req.RefLocations, nil)
+					if len(req.ToRefLocation) == 1 {
+						for name, directory := range req.ToRefLocation {
+							pub, err = NewLocationPublisher(s, name, directory, req.RefLocations, nil)
+						}
+					} else {
+						pub, err = NewManifestPublisher(s, s.ManifestConfig(), req.RefLocations, nil)
+					}
 					if err != nil {
 						return nil, err
 					}

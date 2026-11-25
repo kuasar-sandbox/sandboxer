@@ -138,6 +138,35 @@ func TestExportDiskUploadsLayersFromBorrowedBundle(t *testing.T) {
 	}
 }
 
+func TestExportDiskUploadsLayersToNamedLocation(t *testing.T) {
+	_, storage := manifestPublisherFixture(t)
+	reader, rootRef, sourceDir := borrowedDiskBundle(t, storage)
+	targetDir := t.TempDir()
+	disk, err := reader.ExportDisk(context.Background(), ExportDiskRequest{
+		SourceRef: rootRef, DiskName: "work", Upload: true,
+		ToRefLocation: config.RefLocations{"workspace": targetDir},
+	})
+	requireDiskIO(t, err)
+	for _, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
+		ref, err := manifest.ParseRef(raw)
+		requireDiskIO(t, err)
+		if ref.Scheme != manifest.RefSchemeFile || ref.Location != "workspace" || ref.Digest == "" {
+			t.Fatalf("named publication returned nonportable ref %q", raw)
+		}
+	}
+	files, err := os.ReadDir(targetDir)
+	requireDiskIO(t, err)
+	if len(files) == 0 {
+		t.Fatal("named publication produced no files")
+	}
+	requireDiskIO(t, os.RemoveAll(sourceDir))
+	got := readExportedDisk(t, reader, disk, config.RefLocations{"workspace": targetDir})
+	const page = 4096
+	if !bytes.Equal(got[:page], bytes.Repeat([]byte{'P'}, page)) || !bytes.Equal(got[page:], bytes.Repeat([]byte{'T'}, page)) {
+		t.Fatal("named export lost inherited or written data")
+	}
+}
+
 func compareExportedDisks(t *testing.T, st *ProcessStorage, upload bool) {
 	t.Helper()
 	ctx := context.Background()
