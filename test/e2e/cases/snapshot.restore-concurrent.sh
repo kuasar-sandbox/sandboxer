@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["docker","kvm","tun","userfaultfd"]
 # Concurrent same-snapshot restore fanout and virtio-net backend transitions
 # (sandboxer#161): one snapshot restored repeatedly onto distinct host backends,
 # per-run snap-state/config.json rebinding, and real same-tap collision EBUSY.
@@ -118,8 +119,8 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 
 mkdiff() {
-    truncate -s 1G "$1"
-    mkfs.ext4 -q -F -O ^has_journal "$1"
+    truncate -s 1G "$1.template"
+    mkfs.ext4 -q -F -O ^has_journal "$1.template"
 }
 
 wait_marker() { # <regex> <log> <pid> [attempts]
@@ -261,6 +262,7 @@ boot:
     base: $ROOT_REF
     overlay:
       diff: file://$WORK/blk1-a.diff
+      diff_template: file://$WORK/blk1-a.diff.template
 launch:
   args: ["-c", "import sys,time\nprint('PYBOOT-OK', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
@@ -287,8 +289,6 @@ PRE_SNAP_TICK="$(grep -oE '^TICK [0-9]+' "$LOG_A" | tail -1 | awk '{print $2}')"
 WANT_TICK=$((PRE_SNAP_TICK + 5))
 
 # ============ Stage 2: concurrent restore of S onto TAP_B and TAP_C ========
-mkdiff "$WORK/blk1-b.diff"
-mkdiff "$WORK/blk1-c.diff"
 mk_restore_yaml "$WORK/restore-b.yaml" "$TAP_B" "${GUESTIPS[1]}" "$WORK/blk1-b.diff"
 mk_restore_yaml "$WORK/restore-c.yaml" "$TAP_C" "${GUESTIPS[2]}" "$WORK/blk1-c.diff"
 
@@ -367,7 +367,6 @@ wait "$PID_B" "$PID_C" 2>/dev/null || true
 RUN_PIDS=()
 
 # ================= Stage 3: cross-mode tap → tapfd (S via handoff) =========
-mkdiff "$WORK/blk1-x.diff"
 cat > "$WORK/restore-x.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -415,7 +414,6 @@ RUN_PIDS=()
 
 # ============ Stage 4: cross-mode tapfd → tap (S_fd onto TAP_D) ============
 mkdiff "$WORK/blk1-y.diff"
-mkdiff "$WORK/blk1-d.diff"
 cat > "$WORK/cold-y.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -434,6 +432,7 @@ boot:
     base: $ROOT_REF
     overlay:
       diff: file://$WORK/blk1-y.diff
+      diff_template: file://$WORK/blk1-y.diff.template
 launch:
   args: ["-c", "import time\nprint('NETUP', flush=True)\ni=0\nwhile True:\n    print('TICK', i, flush=True)\n    i+=1\n    time.sleep(0.25)"]
   restart: never
@@ -483,15 +482,17 @@ wait "$PID_D" 2>/dev/null || true
 RUN_PIDS=()
 
 # ====== Stage 5: same-target collision still fails with a real EBUSY =======
+mk_restore_yaml "$WORK/restore-cb.yaml" "$TAP_B" "${GUESTIPS[1]}" "$WORK/blk1-cb.diff"
+mk_restore_yaml "$WORK/restore-cc.yaml" "$TAP_B" "${GUESTIPS[1]}" "$WORK/blk1-cc.diff"
 SID_CB="scr-cb-$BASHPID"
 SID_CC="scr-cc-$BASHPID"
 mkdir -p "$RUNTIME_ROOT/$SID_CB" "$RUNTIME_ROOT/$SID_CC"
 LOG_CB="$OUT/restore-cb.log"
 LOG_CC="$OUT/restore-cc.log"
-launch_run "$SNAP_FILE" "$WORK/restore-b.yaml" "$SID_CB" "$WORK/cb.ready" "$LOG_CB"
+launch_run "$SNAP_FILE" "$WORK/restore-cb.yaml" "$SID_CB" "$WORK/cb.ready" "$LOG_CB"
 PID_CB="$RUN_PID"; READER_CB="$RUN_READER_PID"
 RUN_PIDS+=("$PID_CB")
-launch_run "$SNAP_FILE" "$WORK/restore-b.yaml" "$SID_CC" "$WORK/cc.ready" "$LOG_CC"
+launch_run "$SNAP_FILE" "$WORK/restore-cc.yaml" "$SID_CC" "$WORK/cc.ready" "$LOG_CC"
 PID_CC="$RUN_PID"; READER_CC="$RUN_READER_PID"
 RUN_PIDS+=("$PID_CC")
 
