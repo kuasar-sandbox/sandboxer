@@ -842,6 +842,9 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 				// derive from that effective baseline without changing callers.
 				portable.Boot.Kernel = r.hostProjection.KernelRef
 				portable.Boot.Runtime = r.hostProjection.RuntimeRef
+				// A separately started Runtime owns the boot parameters that
+				// actually took effect, even when its source baseline differs.
+				portable.Boot.Cmdline = cfg.Boot.Cmdline
 				err = portable.Validate()
 			} else {
 				matched, matchErr := config.RuntimeContentMatches(portable.Boot.Runtime, r.hostProjection.RuntimeRef)
