@@ -106,7 +106,7 @@ func rejectRestoreColdOnly(host *SandboxConfig, presence FieldPresence) error {
 	if host.Launch.Systemd != "" || host.Launch.Exec != "" || len(host.Launch.Args) != 0 || len(host.Launch.Env) != 0 ||
 		len(host.Launch.EphemeralEnv) != 0 || host.Launch.Placeholder || len(host.Launch.Plugin) != 0 ||
 		host.Launch.CgroupControl || host.Launch.PIDNamespace != "" || host.Launch.User != "" ||
-		host.Launch.StopSignal != "" || host.Launch.StopGracePeriod != "" || host.Launch.StartTimeout != "" ||
+		host.Launch.RestoreSignal != "" || host.Launch.StopSignal != "" || host.Launch.StopGracePeriod != "" || host.Launch.StartTimeout != "" ||
 		(host.Launch.Workdir != "" && host.Launch.Workdir != "/") ||
 		(host.Launch.Restart != "" && host.Launch.Restart != "never") {
 		return errors.New("run --restore: non-empty launch configuration is cold-start-only")

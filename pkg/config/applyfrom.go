@@ -187,6 +187,9 @@ func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig
 	if presence.Has("launch.user") {
 		launch.User = host.Launch.User
 	}
+	if presence.Has("launch.restore_signal") {
+		launch.RestoreSignal = host.Launch.RestoreSignal
+	}
 	if presence.Has("launch.stop_signal") {
 		launch.StopSignal = host.Launch.StopSignal
 	}
@@ -320,6 +323,7 @@ func sandboxConfigFromPortable(portable *PortableSandboxConfig) *SandboxConfig {
 			Placeholder: portable.Launch.Placeholder, PIDNamespace: portable.Launch.PIDNamespace,
 			Plugin: pluginsFromPortable(portable.Launch.Plugin), User: portable.Launch.User,
 			StopSignal: portable.Launch.StopSignal, StopGracePeriod: portable.Launch.StopGracePeriod,
+			RestoreSignal: portable.Launch.RestoreSignal,
 		},
 		Mounts:   cloneMounts(portable.Mounts),
 		Files:    cloneFiles(portable.Files),

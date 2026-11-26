@@ -43,6 +43,23 @@ func ParseStopSignal(s string) (int, error) {
 	return 0, fmt.Errorf("unknown signal %q", s)
 }
 
+// ParseRestoreSignal resolves an optional restore subscription. Linux amd64 and
+// arm64 both accept signal numbers 1..64; zero is only the internal empty value.
+// Keep StopSignal defaults and legacy numeric parsing independent.
+func ParseRestoreSignal(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	n, err := ParseStopSignal(s)
+	if err != nil {
+		return 0, err
+	}
+	if n > 64 {
+		return 0, fmt.Errorf("invalid signal number %q", s)
+	}
+	return n, nil
+}
+
 // SandboxConfig is the schema parsed from sandbox.yaml.
 //
 // The file co-exists with the manifest config YAML — manifest /
@@ -686,6 +703,9 @@ type LaunchConfig struct {
 	// StopSignal is the shutdown signal name or number ("SIGTERM"/"15");
 	// overrides image config StopSignal. Empty → image StopSignal else SIGTERM.
 	StopSignal string `yaml:"stop_signal,omitempty"`
+	// RestoreSignal subscribes the main process to memory restore notifications.
+	// Empty means no signal; explicit empty YAML clears an inherited subscription.
+	RestoreSignal string `yaml:"restore_signal,omitempty"`
 	// StopGracePeriod is the grace before SIGKILL after StopSignal (Go
 	// duration). Empty → 10s.
 	StopGracePeriod string `yaml:"stop_grace_period,omitempty"`
@@ -730,12 +750,13 @@ type InitConfig struct {
 // PluginConfig declares a companion ("plugin") process supervised alongside
 // the app. Restart is its policy (never|on-failure|always; empty → always).
 type PluginConfig struct {
-	Exec    string            `yaml:"exec"`
-	Args    []string          `yaml:"args,omitempty"`
-	Env     map[string]string `yaml:"env,omitempty"`
-	Workdir string            `yaml:"workdir,omitempty"`
-	User    string            `yaml:"user,omitempty"`
-	Restart string            `yaml:"restart,omitempty"` // never|on-failure|always; empty → always
+	Exec          string            `yaml:"exec"`
+	Args          []string          `yaml:"args,omitempty"`
+	Env           map[string]string `yaml:"env,omitempty"`
+	Workdir       string            `yaml:"workdir,omitempty"`
+	User          string            `yaml:"user,omitempty"`
+	Restart       string            `yaml:"restart,omitempty"` // never|on-failure|always; empty → always
+	RestoreSignal string            `yaml:"restore_signal,omitempty"`
 }
 
 // Load reads one sandbox.yaml and applies defaults.
@@ -1305,9 +1326,15 @@ func (c *SandboxConfig) validateCold(requireCgroupCapability bool) error {
 		if p.Exec == "" {
 			return fmt.Errorf("launch.plugin[%d].exec is required", i)
 		}
+		if _, err := ParseRestoreSignal(p.RestoreSignal); err != nil {
+			return fmt.Errorf("launch.plugin[%d].restore_signal: %w", i, err)
+		}
 		if !validRestart(p.Restart) {
 			return fmt.Errorf("launch.plugin[%d].restart %q invalid (want never|on-failure|always)", i, p.Restart)
 		}
+	}
+	if _, err := ParseRestoreSignal(c.Launch.RestoreSignal); err != nil {
+		return fmt.Errorf("launch.restore_signal: %w", err)
 	}
 	// launch.stop_signal parseable; durations parseable.
 	if c.Launch.StopSignal != "" {
