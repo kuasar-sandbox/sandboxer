@@ -209,6 +209,9 @@ func TestPublisherWritesMemorySandboxAndSnapshotBottomUp(t *testing.T) {
 	if failed.Ref != "" || failed.Role != RoleSnapshot {
 		t.Fatalf("failed root publication returned %+v", failed)
 	}
+	if failed.Refs || failed.SandboxRef != "" || failed.SnapshotRefs != nil || failed.SandboxRefs != nil || failed.RemovedRefs != nil {
+		t.Fatalf("failed root publication returned a reference report: %+v", failed)
+	}
 	failedRoles := make([]LogicalRole, len(failingTarget.calls))
 	for i := range failingTarget.calls {
 		failedRoles[i] = failingTarget.calls[i].role

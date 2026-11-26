@@ -30,7 +30,7 @@ func exportCmd(args []string) int {
 	sourceRef := fs.String("source-ref", "", "offline saved Sandbox E or Snapshot S")
 	sourceDir := fs.String("source-dir", "", "root for relative saved source refs")
 	diskName := fs.String("disk", "", "export only this saved data disk")
-	jsonOutput := fs.Bool("json", false, "emit the completed Sandbox E reference as JSON")
+	jsonOutput := fs.Bool("json", false, "emit JSON; uploads include complete artifact reference reports")
 	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for image assembly")
 	pathID := fs.String("path-id", "", "live run-root directory leaf (takes precedence over --sandbox-id)")
 	from := fs.String("from", "", "flattened EROFS reference for image-to-Sandbox-E assembly")
@@ -98,7 +98,22 @@ func exportCmd(args []string) int {
 			ctx, cancel = context.WithTimeout(ctx, time.Duration(*timeoutS)*time.Second)
 			defer cancel()
 		}
-		result, err := storage.ExportDisk(ctx, artifact.ExportDiskRequest{SourceRef: *sourceRef, SourceDir: *sourceDir, DiskName: *diskName, OutputDir: *outDir, Upload: *upload, RefLocations: refLocations, ToRefLocation: target})
+		req := artifact.ExportDiskRequest{SourceRef: *sourceRef, SourceDir: *sourceDir, DiskName: *diskName, OutputDir: *outDir, Upload: *upload, RefLocations: refLocations, ToRefLocation: target}
+		var result any
+		if *upload && *jsonOutput {
+			var exported artifact.DiskExportResult
+			exported, err = storage.ExportDiskWithReport(ctx, req)
+			if err == nil {
+				var report artifact.DiskReport
+				report, err = exported.Report()
+				result = struct {
+					Disk artifact.DiskV1 `json:"disk"`
+					artifact.DiskReport
+				}{Disk: exported.Disk, DiskReport: report}
+			}
+		} else {
+			result, err = storage.ExportDisk(ctx, req)
+		}
 		if err = errors.Join(err, storage.Close()); err == nil {
 			err = json.NewEncoder(os.Stdout).Encode(result)
 		}
@@ -246,6 +261,9 @@ func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume
 		_ = conn.SetDeadline(time.Now().Add(time.Duration(timeoutS) * time.Second))
 	}
 	req := ctl.Request{Type: ctl.TypeExportRequest, OutDir: outDir, Upload: upload, ResumeAfter: resume}
+	if upload && jsonOutput {
+		req.Type = ctl.TypeExportReportRequest
+	}
 	if len(checkpointIDs) > 0 && checkpointIDs[0] != "" {
 		req.Type = ctl.TypeCheckpointExportRequest
 		req.CheckpointID = checkpointIDs[0]
@@ -258,7 +276,12 @@ func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume
 		return 1
 	}
 	var resp ctl.Response
-	if err := ctl.ReadMessage(conn, &resp); err != nil {
+	if upload && jsonOutput {
+		resp, err = ctl.ReadExportReportResponse(conn)
+	} else {
+		err = ctl.ReadMessage(conn, &resp)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: receive response: %v\n", err)
 		return 1
 	}
@@ -299,13 +322,23 @@ func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload b
 		fmt.Fprintf(os.Stderr, "export: local crypto: %v\n", err)
 		return 1
 	}
-	defer storage.Close()
+	storageOpen := true
+	defer func() {
+		if storageOpen {
+			_ = storage.Close()
+		}
+	}()
 	image, err := sandbox.OpenFlattenedImage(ctx, raw, storage, locations)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: %v\n", err)
 		return 1
 	}
-	defer image.Close()
+	imageOpen := true
+	defer func() {
+		if imageOpen {
+			_ = image.Close()
+		}
+	}()
 	opener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		return storage.OpenFileWithLocations(ctx, path, ref, locations)
 	})
@@ -334,7 +367,7 @@ func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload b
 		Cfg: cfg, PortableConfig: portable, ManifestCfg: manifestCfg,
 		Fetcher: storage.Fetcher(), RefLocations: locations,
 		CustomerKeyFn: storage.CustomerKeyFunc(), LocalCodec: storage.LocalCodec(), LocalRequired: storage.LocalRequired(),
-	}, make([]bool, 1+len(portable.Boot.Disks)), outDir, admission, bundleTarget)
+	}, make([]bool, 1+len(portable.Boot.Disks)), outDir, admission, bundleTarget, upload && jsonOutput)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "export: dependencies: %v\n", err)
 		return 1
@@ -400,7 +433,45 @@ func assembleSandboxEExport(raw, configPaths, sandboxID, outDir string, upload b
 	if parsed, err := manifest.ParseRef(ref); err == nil && parsed.Scheme == manifest.RefSchemeManifest {
 		resp.SandboxManifestKey = parsed.Path
 	}
+	if upload && jsonOutput {
+		before := dependencyPlan.OriginalRefs()
+		input, err := assemblyInputReference(raw)
+		if err == nil {
+			before = append(before, input)
+			var result artifact.PublishResult
+			result, err = artifact.NewSandboxPublishResult(ref, portable, before)
+			if err == nil {
+				resp.ExportReferences = &ctl.ExportReferences{SandboxRefs: result.SandboxRefs, RemovedRefs: result.RemovedRefs}
+			}
+		}
+		imageOpen, storageOpen = false, false
+		err = errors.Join(err, image.Close(), storage.Close())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "export: finalize upload report: %v\n", err)
+			return 1
+		}
+	}
 	return printExportResult(upload, resp, jsonOutput)
+}
+
+// The flattened image has one explicit carrier (no Bundle fallback selection).
+// Keep its complete local scope for the operation delta until Report projects it.
+func assemblyInputReference(raw string) (string, error) {
+	if !strings.HasPrefix(raw, "file://") && !strings.HasPrefix(raw, "manifest://") {
+		path, err := filepath.Abs(raw)
+		if err != nil {
+			return "", err
+		}
+		return (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}).String(), nil
+	}
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return "", err
+	}
+	if ref.Scheme == manifest.RefSchemeFile && ref.Location == "" {
+		ref.Path, err = filepath.Abs(ref.Path)
+	}
+	return ref.String(), err
 }
 
 func newAssemblyArtifactSink(outDir, sandboxID string, upload bool, mode string, manifestCfg *config.ManifestConfig, storage *artifact.ProcessStorage, admission store.WriteAdmission, refs []string) (snapshot.ArtifactSink, error) {
@@ -423,6 +494,9 @@ func newAssemblyArtifactSink(outDir, sandboxID string, upload bool, mode string,
 
 func printExportResult(upload bool, resp ctl.Response, jsonOutput bool) int {
 	if jsonOutput {
+		if upload {
+			return printExportReportJSON(resp)
+		}
 		return printCaptureJSON(resp, artifact.RoleSandbox)
 	}
 	if upload {
@@ -437,6 +511,28 @@ func printExportResult(upload bool, resp ctl.Response, jsonOutput bool) int {
 	}
 	if resp.SandboxRef != "" {
 		fmt.Printf("  ref:       %s\n", resp.SandboxRef)
+	}
+	return 0
+}
+
+func printExportReportJSON(resp ctl.Response) int {
+	if resp.Type != ctl.TypeExportDone || resp.ExportReferences == nil {
+		fmt.Fprintln(os.Stderr, "export: missing completed upload reference report")
+		return 1
+	}
+	report, err := (artifact.PublishResult{
+		Role: artifact.RoleSandbox, Ref: resp.SandboxRef, Refs: true,
+		SandboxRefs: resp.ExportReferences.SandboxRefs, RemovedRefs: resp.ExportReferences.RemovedRefs,
+	}).Report()
+	if err == nil {
+		err = report.Validate(artifact.RoleSandbox)
+	}
+	if err == nil {
+		err = json.NewEncoder(os.Stdout).Encode(report)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "export: invalid upload reference report: %v\n", err)
+		return 1
 	}
 	return 0
 }

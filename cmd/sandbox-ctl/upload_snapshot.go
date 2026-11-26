@@ -36,7 +36,7 @@ func publishArtifactCmd(command string, args []string) int {
 	fs.Var(&replaceRefs, "replace-ref", "replace one reference OLD=NEW (repeatable for disjoint references)")
 	fs.Var(&reduceRefs, "reduce-ref", "reduce a complete reference chain A=X, A, or any (disjoint from replacement rules)")
 	skipVerifyRef := fs.Bool("skip-verify-ref", false, "skip replacement equivalence proof (identity and I/O checks remain enabled)")
-	jsonOutput := fs.Bool("json", false, "print final root references and removedRefs as JSON")
+	jsonOutput := fs.Bool("json", false, "print final roots, complete reference sets and removedRefs as JSON")
 	deleteCheckpoint := fs.Bool("delete-checkpoint", false, "delete the exact local versions after successful publication")
 	checkpointSources := fs.String("checkpoint-sources", "", "complete source graphs by directory (JSON array) for --delete-checkpoint")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
@@ -129,6 +129,9 @@ func publishArtifactCmd(command string, args []string) int {
 		}
 	}
 	if *jsonOutput {
+		if storageCloseErr != nil {
+			return exitCode
+		}
 		report, err := result.Report()
 		if err == nil {
 			err = json.NewEncoder(os.Stdout).Encode(report)

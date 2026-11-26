@@ -76,6 +76,24 @@ func TestExportDiskCLIProducesBindableJSON(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(namedDir, namedRef.Path)); err != nil {
 		t.Fatalf("named output file missing: %v", err)
 	}
+	rc, stdout, stderr = captureInfoOutput(t, func() int { return exportCmd(append(slices.Clone(namedArgs), "--json")) })
+	if rc != 0 {
+		t.Fatalf("named JSON export rc=%d stderr=%s", rc, stderr)
+	}
+	var namedResult struct {
+		Disk artifact.DiskV1 `json:"disk"`
+		artifact.DiskReport
+	}
+	if err := json.Unmarshal([]byte(stdout), &namedResult); err != nil {
+		t.Fatal(err)
+	}
+	if err := namedResult.DiskReport.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	oldLayer, _ := artifact.PublicRef(layer)
+	if !slices.Equal(namedResult.DiskRefs, []string{namedResult.Disk.Base}) || !slices.Equal(namedResult.RemovedRefs, []string{oldLayer}) {
+		t.Fatalf("named upload report lost the selected disk delta: %s", stdout)
+	}
 	rc, stdout, _ = captureInfoOutput(t, func() int { return exportCmd(append(args, "--resume")) })
 	if rc != 2 || stdout != "" {
 		t.Fatalf("accepted live option: rc=%d stdout=%q", rc, stdout)
@@ -158,6 +176,38 @@ func TestExportDiskCLIRetainsPublishedGraphWithoutManifestConfig(t *testing.T) {
 		}
 		if _, err := os.Stat(output); !os.IsNotExist(err) {
 			t.Fatalf("all-retained graph created output: %v", err)
+		}
+		rc, stdout, stderr = captureInfoOutput(t, func() int { return exportCmd(append(slices.Clone(args), "--json")) })
+		if rc != 0 {
+			t.Fatalf("mode=%s JSON: rc=%d stderr=%s", mode, rc, stderr)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(stdout), &fields); err != nil {
+			t.Fatal(err)
+		}
+		if mode == "local" {
+			if fields["refs"] != nil || fields["disk"] != nil || fields["base"] == nil {
+				t.Fatalf("local disk JSON changed: %s", stdout)
+			}
+			continue
+		}
+		var reported struct {
+			Disk artifact.DiskV1 `json:"disk"`
+			artifact.DiskReport
+		}
+		if err := json.Unmarshal([]byte(stdout), &reported); err != nil {
+			t.Fatal(err)
+		}
+		if err := reported.DiskReport.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		wantRefs := append([]string{base}, parents...)
+		slices.Sort(wantRefs)
+		if len(fields) != 4 || fields["diskRef"] != nil || reported.Disk.Base != base || !slices.Equal(reported.Disk.BaseFromRefs, parents) || !slices.Equal(reported.DiskRefs, wantRefs) || len(reported.RemovedRefs) != 0 {
+			t.Fatalf("upload disk report differs from retained graph: %s", stdout)
+		}
+		if _, err := os.Stat(output); !os.IsNotExist(err) {
+			t.Fatalf("reported all-retained graph created output: %v", err)
 		}
 	}
 }

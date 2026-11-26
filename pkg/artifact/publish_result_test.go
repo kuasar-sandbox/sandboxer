@@ -34,6 +34,9 @@ func assertRemoved(t *testing.T, result PublishResult, want ...string) {
 		expected = append(expected, ref)
 	}
 	sort.Strings(expected)
+	if !result.Refs && len(want) == 0 {
+		expected = nil
+	}
 	if !reflect.DeepEqual(report.RemovedRefs, expected) {
 		t.Fatalf("removed=%v want=%v", report.RemovedRefs, expected)
 	}
@@ -47,10 +50,19 @@ func assertRemoved(t *testing.T, result PublishResult, want ...string) {
 	}
 	count := 2
 	if result.Role == RoleSnapshot {
-		count = 3
+		count++
 	}
-	if len(shape) != count || shape["sandboxRef"] == nil || shape["removedRefs"] == nil {
+	if result.Refs {
+		count += 2
+		if result.Role == RoleSnapshot {
+			count++
+		}
+	}
+	if len(shape) != count || shape["refs"] == nil || shape["sandboxRef"] == nil || (shape["removedRefs"] != nil) != result.Refs {
 		t.Fatalf("shape=%s", body)
+	}
+	if _, err := DecodePublishReport(body, result.Role); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -58,17 +70,31 @@ func TestReportScopesBeforeProjection(t *testing.T) {
 	p := (&Publisher{}).operation()
 	for _, identity := range []string{"", "@digest:" + publishTestSHA, "@hmac:" + publishTestSHA, "@manifest:" + publishTestSHA} {
 		p.original("file://same.bundle"+identity, publishScope{relativeDir: "/source/one"})
-		p.retained("file://same.bundle"+identity, publishScope{relativeDir: "/source/two"})
+		p.report.sandboxRefs = append(p.report.sandboxRefs, "file:///source/two/same.bundle"+identity)
 	}
 	// Alternate spellings in the same source scope compare before projection.
 	p.original("file://retained.sandbox", publishScope{relativeDir: "/source/one"})
-	p.retained("file:///source/one/./retained.sandbox", publishScope{})
-	result := p.result(RoleSandbox, "manifest://"+publishTestSHA, "")
-	assertRemoved(t, result, "file://same.bundle", "file://same.bundle@digest:"+publishTestSHA, "file://same.bundle@hmac:"+publishTestSHA, "file://same.bundle@manifest:"+publishTestSHA)
-	report, _ := result.Report()
-	raw, _ := json.Marshal(report)
-	if strings.Contains(string(raw), "/source") {
-		t.Fatalf("private path: %s", raw)
+	p.report.sandboxRefs = append(p.report.sandboxRefs, scopedRef("file:///source/one/./retained.sandbox", publishScope{}))
+	result, err := p.result(RoleSandbox, "manifest://"+publishTestSHA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"file:///source/one/same.bundle", "file:///source/one/same.bundle@digest:" + publishTestSHA, "file:///source/one/same.bundle@hmac:" + publishTestSHA, "file:///source/one/same.bundle@manifest:" + publishTestSHA}
+	if !reflect.DeepEqual(result.RemovedRefs, want) {
+		t.Fatalf("internal removed=%v want=%v", result.RemovedRefs, want)
+	}
+	public, err := publicReferences(result.RemovedRefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(public, ","), "/source") {
+		t.Fatalf("private path: %v", public)
+	}
+	// This synthetic graph has two private files with the same public name.
+	// Public reports reject that ambiguity rather than presenting a final ref
+	// as simultaneously removed. Real publication binds final refs to a target.
+	if _, err := result.Report(); err == nil {
+		t.Fatal("ambiguous public reference sets accepted")
 	}
 }
 

@@ -111,6 +111,9 @@ type Response struct {
 	DiskRefs            []string               `json:"disk_refs,omitempty"`
 	DiskPaths           []string               `json:"disk_paths,omitempty"`
 	DropCachesResult    proto.DropCachesResult `json:"drop_caches_result,omitempty"`
+	// ExportReferences is present only for an export_report_request. DiskRefs
+	// above remains the newly captured data disks, not the complete E graph.
+	ExportReferences *ExportReferences `json:"export_references,omitempty"`
 
 	// exec_ack: the stdio channel set the guest actually established
 	// (the caller bridges exactly these MUX streams).
@@ -159,6 +162,7 @@ const (
 	TypeSnapshotRequest       = "snapshot_request"
 	TypeSnapshotDone          = "snapshot_done"
 	TypeExportRequest         = "export_request"
+	TypeExportReportRequest   = "export_report_request"
 	TypeExportDone            = "export_done"
 	TypeExecRequest           = "exec_request"
 	TypeExecAck               = "exec_ack"

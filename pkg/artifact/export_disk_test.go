@@ -313,8 +313,23 @@ func compareExportedDisks(t *testing.T, st *ProcessStorage, upload bool) {
 			req.OutputDir = ""
 			req.Upload = true
 		}
-		out, e := st.ExportDisk(ctx, req)
-		requireDiskIO(t, e)
+		var out DiskV1
+		if upload {
+			result, e := st.ExportDiskWithReport(ctx, req)
+			requireDiskIO(t, e)
+			out = result.Disk
+			report, e := result.Report()
+			requireDiskIO(t, e)
+			requireReferenceSet(t, report.DiskRefs, out.Base, out.BaseFromRefs[0])
+			publicTop, e := PublicRef(top)
+			requireDiskIO(t, e)
+			publicBase, e := PublicRef(base)
+			requireDiskIO(t, e)
+			requireReferenceSet(t, report.RemovedRefs, publicTop, publicBase)
+		} else {
+			out, e = st.ExportDisk(ctx, req)
+			requireDiskIO(t, e)
+		}
 		disks = append(disks, out)
 		same, e := st.ExportDisk(ctx, req)
 		requireDiskIO(t, e)
@@ -364,8 +379,21 @@ func TestExportDiskCheckpointPinsOnlyNamedVersion(t *testing.T) {
 			locations = config.RefLocations{"out": target}
 			req.OutputDir, req.Upload, req.ToRefLocation = "", true, locations
 		}
-		out, err := st.ExportDisk(ctx, req)
-		requireDiskIO(t, err)
+		var out DiskV1
+		if named {
+			result, e := st.ExportDiskWithReport(ctx, req)
+			requireDiskIO(t, e)
+			out = result.Disk
+			report, e := result.Report()
+			requireDiskIO(t, e)
+			requireReferenceSet(t, report.DiskRefs, out.Base)
+			if len(report.RemovedRefs) != 0 {
+				t.Fatalf("invented DIFF/source-root removal: %v", report.RemovedRefs)
+			}
+		} else {
+			out, err = st.ExportDisk(ctx, req)
+			requireDiskIO(t, err)
+		}
 		b := readExportedDisk(t, st, out, locations)
 		if !bytes.Equal(b[:4096], bytes.Repeat([]byte{3}, 4096)) {
 			t.Fatalf("wrong checkpoint disk or version (named=%t)", named)

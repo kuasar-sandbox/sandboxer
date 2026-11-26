@@ -107,6 +107,7 @@ func (p *Publisher) publishBundle(
 	// Exact publication preserves logical keys, but changes their source binding.
 	// Selection metadata is already required by the transfer; reporting does not
 	// re-open any member or consult an unselected fallback.
+	finalBindings := make(map[string]string, len(dependencies))
 	for _, key := range dependencies {
 		raw := "manifest://" + manifest.HexKey(key)
 		before, after := raw, raw
@@ -119,12 +120,24 @@ func (p *Publisher) publishBundle(
 			}
 		}
 		p.original(before, publishScope{relativeDir: filepath.Dir(sourcePath)})
-		p.retained(after, publishScope{})
+		finalBindings[raw] = after
 		if sandboxRef == raw {
 			sandboxRef = after
 		}
 	}
-	return p.result(role, ref, sandboxRef), nil
+	for i, raw := range p.report.snapshotRefs {
+		if bound, ok := finalBindings[raw]; ok {
+			p.report.snapshotRefs[i] = bound
+		}
+	}
+	if !p.report.retainedSandbox {
+		for i, raw := range p.report.sandboxRefs {
+			if bound, ok := finalBindings[raw]; ok {
+				p.report.sandboxRefs[i] = bound
+			}
+		}
+	}
+	return p.result(role, ref, sandboxRef)
 }
 
 func selectExactBundleSources(
@@ -191,6 +204,7 @@ func (p *Publisher) inspectBundleRoot(
 		if sandboxRoot.Checkpoint != nil {
 			return RoleSandbox, nil, "", errBundleCheckpoint
 		}
+		p.sandboxGroup(sandboxRoot.Portable)
 		if err := p.retainLocatedDisks(sandboxRoot.Portable, rootScope); err != nil {
 			return "", nil, "", err
 		}
@@ -224,6 +238,7 @@ func (p *Publisher) inspectBundleRoot(
 		return "", nil, "", errors.New("publish Bundle: snapshot.cfg is not canonically encoded")
 	}
 
+	p.report.snapshotRefs = append([]string{}, cfg.FromRefs...)
 	for _, raw := range cfg.FromRefs {
 		if err := p.retainLocated(raw, childScope); err != nil {
 			return "", nil, "", err
@@ -253,14 +268,22 @@ func (p *Publisher) inspectBundleRoot(
 	if err := p.retainLocated(cfg.SandboxRef, childScope); err != nil {
 		return "", nil, "", err
 	}
+	parsedE, err := manifest.ParseRef(cfg.SandboxRef)
+	if err != nil {
+		return "", nil, "", err
+	}
+	p.report.retainedSandbox = parsedE.Scheme == manifest.RefSchemeFile
+	if p.report.retainedSandbox {
+		if err := p.retainedSandboxGroup(ctx, sandboxRoot.Portable, sandboxScope); err != nil {
+			return "", nil, "", err
+		}
+	} else {
+		p.sandboxGroup(sandboxRoot.Portable)
+	}
 	if err := p.retainLocatedDisks(sandboxRoot.Portable, sandboxScope); err != nil {
 		return "", nil, "", err
 	}
 	if err := appendManifestDependency(cfg.SandboxRef, "snapshot sandbox_ref", seen, &dependencies); err != nil {
-		return "", nil, "", err
-	}
-	parsedE, err := manifest.ParseRef(cfg.SandboxRef)
-	if err != nil {
 		return "", nil, "", err
 	}
 	if parsedE.Scheme == manifest.RefSchemeManifest {
@@ -326,7 +349,6 @@ func (p *Publisher) retainLocated(raw string, scope publishScope) error {
 	}
 	if ref.Scheme == manifest.RefSchemeFile && ref.Location != "" {
 		p.original(raw, scope)
-		p.retained(raw, scope)
 	}
 	return nil
 }
@@ -392,7 +414,10 @@ func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, sco
 			return PublishResult{}, errors.Join(errors.New("runtime declaration requires a Snapshot root"), root.Close())
 		}
 		ref, err := p.publishSandboxRoot(ctx, raw, child, root)
-		return p.result(RoleSandbox, ref, ref), err
+		if err != nil {
+			return PublishResult{}, err
+		}
+		return p.result(RoleSandbox, ref, ref)
 	}
 	stream, child, err = p.open(ctx, raw, scope)
 	if err != nil {
@@ -403,5 +428,8 @@ func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, sco
 		return PublishResult{}, err
 	}
 	ref, e, err := p.publishSnapshotRoot(ctx, raw, child, snap)
-	return p.result(RoleSnapshot, ref, e), err
+	if err != nil {
+		return PublishResult{}, err
+	}
+	return p.result(RoleSnapshot, ref, e)
 }

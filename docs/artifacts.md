@@ -324,22 +324,52 @@ newline. An output write failure is a command failure.
 Sandbox E:
 
 ```json
-{"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}
+{"refs":true,"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}
 ```
 
 Snapshot S:
 
 ```json
-{"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","file://old.snapshot"]}
+{"refs":true,"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","snapshotRefs":["manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","file://old.snapshot"]}
 ```
 
-Sandbox has only `sandboxRef` and `removedRefs`; Snapshot additionally has
-`snapshotRef`. Snapshot's `sandboxRef` is the E actually referenced by final S,
+`refs:true` supplies every applicable complete reference set. `sandboxRefs`
+contains final E and every immutable root/data-disk layer, including attached
+Workspace disks; `snapshotRefs` contains final S and its memory parents. The
+examples above have no retained parents. Arrays are sorted and unique, contain
+their corresponding roots, and describe sets rather than recovery order.
+Snapshot's `sandboxRef` is the E actually referenced by final S,
 including a reused E or the selector of its chosen Bundle carrier. For example,
 an E in the final located Bundle is `file://<carrier>.bundle@manifest:<E-key>@location:<name>`;
 an E chosen from remote storage remains `manifest://<E-key>`. Equal content keys
 in different carriers, locations or domains do not by themselves identify the
-same reference. Empty `removedRefs` is `[]`, never `null`.
+same reference. A complete report always includes `removedRefs`; an empty
+difference is `[]`, never `null`. Completeness describes known metadata, not a
+new check that every retained object is currently accessible.
+
+`refs:false` retains only the required roots and omits `snapshotRefs`,
+`sandboxRefs`, `diskRefs` and `removedRefs`. Even an empty or null `removedRefs`
+is invalid in this form. Missing arrays do not describe empty dependencies or
+an empty difference. A decoder accepts only the exact old S/E report shape
+without `refs`, validates it under the old rules, then normalizes it to
+`refs:false` and drops the old difference. Explicit false cannot use that
+compatibility branch. Null/wrong-type `refs`, duplicate or unknown fields,
+role mismatches and trailing output remain errors.
+
+The same report contract applies to `export --upload --json`, including live E,
+assembled E and selected-disk upload. Local `export --output` and every
+`snapshot` command retain their existing JSON and default output. Publish's
+default full root ref, E upload's default bare Manifest key and selected-disk
+upload's default bare DiskV1 remain unchanged.
+
+Selected-disk `export --source-ref REF --disk NAME --upload --json` returns
+`disk: DiskV1` together with `refs:true`, `diskRefs` and `removedRefs`, including
+the `--to-ref-location` variant. `diskRefs` contains the final `disk.base` and
+all `disk.base_from_refs`, sorted and deduplicated. There is no `diskRef` field;
+capacity and layer order remain in `disk`. Only the selected disk participates
+in its difference: lookup S/E roots, unrelated disks and memory are excluded.
+`--output`, with or without `--json`, still returns a bare DiskV1. Consumers of
+the former bare single-disk `--upload --json` must read the new `disk` field.
 
 `removedRefs` is the original topology minus the retained final topology within
 the operation's existing parsing boundary. It includes old roots and known local
@@ -355,6 +385,8 @@ Unchanged opaque branches retain their known boundaries without descendant scans
 
 With `--skip-verify-ref`, an old replaced ref is a leaf whether readable or
 missing. Reporting never opens old E or its descendants to discover removals.
+An unselected Bundle lookup alias without a known carrier is omitted from the
+known old set; it must not be reported as a Manifest Store object.
 An explicit native `(base=A, base_from_refs=[B,C])` still knows all of A/B/C,
 including the explicit `--reduce-ref A=X` shortcut. Default verification may
 reuse the original config it already parsed for equivalence. Reporting adds no
@@ -378,8 +410,11 @@ selector leaving the topology does not mean the physical Bundle is unreferenced;
 other checkpoints, retained versions or sandboxes can still use it. Source
 retention and garbage collection remain their owners' responsibilities.
 
-The library retains `PublishResult.Role`/`Ref` and adds `SandboxRef` and
-`RemovedRefs`; `result.Report()` produces the safe public `PublishReport`.
+The library retains `PublishResult.Role`/`Ref`, the paired `SandboxRef`, complete
+scoped reference sets and the known difference; `result.Report()` produces the
+safe public `PublishReport`. `ExportDisk(ctx, req)` still returns DiskV1;
+`ExportDiskWithReport(ctx, req)` returns the same final DiskV1 and its report
+metadata from one export, with `Report()` providing the public disk report.
 Image-only `PublishSource(ctx, RoleImage, source)` callers are unchanged. For an
 already assembled Snapshot, the caller supplies its known final E:
 
@@ -387,9 +422,10 @@ already assembled Snapshot, the caller supplies its known final E:
 result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
 ```
 
-This creation path owns no original root, so its removals are empty. It uses the
-caller-supplied role and final E without scanning the assembled source or opening
-its published dependencies. The caller keeps ownership of the assembled source.
+This opaque creation path uses the caller-supplied role and final E without
+scanning the assembled source or opening its published dependencies. If its
+S/E report is requested, it returns `refs:false` and omits all collections,
+including `removedRefs`. The caller keeps ownership of the assembled source.
 
 ```bash
 sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot

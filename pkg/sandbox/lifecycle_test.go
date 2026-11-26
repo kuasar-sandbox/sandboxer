@@ -1010,13 +1010,26 @@ func TestBundleMemoryMergeUsesSnapshotBundleProvenance(t *testing.T) {
 		{name: "disk", value: artifactDependency{raw: sandboxRef, role: dependencyDiskLayer}, reader: sandboxOpened.BundleReader()},
 	} {
 		t.Run(dependency.name+" dependency selector", func(t *testing.T) {
-			stream, reader, _, _, err := openSnapshotDependency(ctx, dependency.value, opts, nil, "")
+			var selected string
+			stream, reader, _, _, err := openSnapshotDependency(ctx, dependency.value, opts, nil, "", &selected)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer stream.Close()
 			if reader != dependency.reader {
 				t.Fatalf("selected Bundle reader = %p, want %p", reader, dependency.reader)
+			}
+			selectedRef, err := manifest.ParseRef(selected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPath := sandboxPath
+			if dependency.name == "memory" {
+				wantPath = snapshotPath
+			}
+			logicalRef, _ := manifest.ParseRef(dependency.value.raw)
+			if selectedRef.Path != wantPath || selectedRef.DigestScheme != "manifest" || selectedRef.Digest != logicalRef.Path {
+				t.Fatalf("reported wrong selected carrier: %q want %q", selected, wantPath)
 			}
 		})
 	}
