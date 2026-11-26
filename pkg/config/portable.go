@@ -112,17 +112,19 @@ type PortableLaunchConfig struct {
 	Plugin          []PortablePluginConfig `yaml:"plugin,omitempty"`
 	User            string                 `yaml:"user,omitempty"`
 	StopSignal      string                 `yaml:"stop_signal,omitempty"`
+	RestoreSignal   string                 `yaml:"restore_signal,omitempty"`
 	StopGracePeriod string                 `yaml:"stop_grace_period,omitempty"`
 }
 
 // PortablePluginConfig retains a persistent companion process definition.
 type PortablePluginConfig struct {
-	Exec    string            `yaml:"exec"`
-	Args    []string          `yaml:"args,omitempty"`
-	Env     map[string]string `yaml:"env,omitempty"`
-	Workdir string            `yaml:"workdir,omitempty"`
-	User    string            `yaml:"user,omitempty"`
-	Restart string            `yaml:"restart,omitempty"`
+	Exec          string            `yaml:"exec"`
+	Args          []string          `yaml:"args,omitempty"`
+	Env           map[string]string `yaml:"env,omitempty"`
+	Workdir       string            `yaml:"workdir,omitempty"`
+	User          string            `yaml:"user,omitempty"`
+	Restart       string            `yaml:"restart,omitempty"`
+	RestoreSignal string            `yaml:"restore_signal,omitempty"`
 }
 
 // PortableProjection supplies identities whose source paths are host-only.
@@ -401,7 +403,7 @@ func portableLaunch(in LaunchConfig) PortableLaunchConfig {
 		Workdir: in.Workdir, Restart: in.Restart, CgroupControl: in.CgroupControl,
 		Placeholder: in.Placeholder, PIDNamespace: in.PIDNamespace,
 		Plugin: portablePlugins(in.Plugin), User: in.User, StopSignal: in.StopSignal,
-		StopGracePeriod: in.StopGracePeriod,
+		StopGracePeriod: in.StopGracePeriod, RestoreSignal: in.RestoreSignal,
 	}
 }
 
@@ -432,7 +434,7 @@ func portablePlugins(in []PluginConfig) []PortablePluginConfig {
 	for i := range in {
 		out[i] = PortablePluginConfig{
 			Exec: in[i].Exec, Args: append([]string(nil), in[i].Args...), Env: cloneMap(in[i].Env),
-			Workdir: in[i].Workdir, User: in[i].User, Restart: in[i].Restart}
+			Workdir: in[i].Workdir, User: in[i].User, Restart: in[i].Restart, RestoreSignal: in[i].RestoreSignal}
 	}
 	return out
 }
@@ -441,7 +443,7 @@ func pluginsFromPortable(in []PortablePluginConfig) []PluginConfig {
 	out := make([]PluginConfig, len(in))
 	for i := range in {
 		out[i] = PluginConfig{Exec: in[i].Exec, Args: append([]string(nil), in[i].Args...),
-			Env: cloneMap(in[i].Env), Workdir: in[i].Workdir, User: in[i].User, Restart: in[i].Restart}
+			Env: cloneMap(in[i].Env), Workdir: in[i].Workdir, User: in[i].User, Restart: in[i].Restart, RestoreSignal: in[i].RestoreSignal}
 	}
 	return out
 }
@@ -972,6 +974,9 @@ func validatePortableLaunch(p *PortableSandboxConfig) error {
 	default:
 		return fmt.Errorf("portable launch.pid_namespace %q is invalid", launch.PIDNamespace)
 	}
+	if _, err := ParseRestoreSignal(launch.RestoreSignal); err != nil {
+		return fmt.Errorf("portable launch.restore_signal: %w", err)
+	}
 	if launch.StopSignal != "" {
 		if _, err := ParseStopSignal(launch.StopSignal); err != nil {
 			return fmt.Errorf("portable launch.stop_signal: %w", err)
@@ -985,6 +990,9 @@ func validatePortableLaunch(p *PortableSandboxConfig) error {
 	for i, plugin := range launch.Plugin {
 		if plugin.Exec == "" {
 			return fmt.Errorf("portable launch.plugin[%d].exec is required", i)
+		}
+		if _, err := ParseRestoreSignal(plugin.RestoreSignal); err != nil {
+			return fmt.Errorf("portable launch.plugin[%d].restore_signal: %w", i, err)
 		}
 		if !validRestart(plugin.Restart) {
 			return fmt.Errorf("portable launch.plugin[%d].restart %q is invalid", i, plugin.Restart)

@@ -260,6 +260,7 @@ sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 | `launch.pid_namespace` | `private`、`shared`；`private` | Private 使应用成为 namespace PID 1；shared 暴露负责回收孤儿的 Runtime PID 1 |
 | `launch.user` | 身份 String；镜像 user，否则 root | `uid:gid` 或 `name:group` |
 | `launch.stop_signal` | 信号名/数字；镜像值，否则 `SIGTERM` | 停止信号 |
+| `launch.restore_signal`、`launch.plugin[].restore_signal` | 可选信号名或十进制字符串；无默认值 | 内存恢复时独立通知存活的主程序/plugin 主进程；`""` 清除继承。Linux 1–64；[Guest 约定](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi_zh.md#restore-notifications) |
 | `launch.stop_grace_period` | Duration；`10s` | SIGKILL 前宽限期，以整秒传给 Guest |
 | `launch.start_timeout` | Duration；空/零无强制限制 | Host 等待 `launch_ack`，包含有序 init 工作 |
 | `launch.plugin[].exec`、`.args`、`.env`、`.workdir`、`.user` | String/list/map/string/string | 同 workload root/cgroup 内的伴随进程；进程 ABI 见 [Guest ABI](guest-abi_zh.md#launch-spec) |
@@ -270,6 +271,16 @@ sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 | `init[].exec`、`.args`、`.env`、`.workdir`、`.user` | String/list/map/string/string | 应用启动前按顺序执行的一次性命令 |
 | `init[].timeout` | Duration；空/零无限制 | 非零退出或 timeout 中止初始化 |
 | `metadata` | String map；空 | Opaque portable 值，runtime 不解释 |
+
+### 恢复信号策略
+
+支持 `restore_signal: SIGUSR1`、`restore_signal: USR1` 或 `restore_signal: "10"`。
+普通冷启动省略表示不通知；从 E 冷派生时省略继承，显式 `restore_signal: ""` 清除。
+主程序与 plugin 字段相互独立，plugin 列表继续整体替换。策略可持久保存，并随导出和
+捕获保留。内存 restore 使用捕获的策略，拒绝 launch 覆盖。本字段不继承 OCI StopSignal
+或停止信号默认值。信号不等待业务初始化完成；systemd 用户可以按
+[Guest 约定](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi_zh.md#restore-notifications)
+在 `sandbox-restore.target` 上注册同步服务。
 
 ### Systemd 启动策略
 
