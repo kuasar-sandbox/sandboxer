@@ -14,13 +14,13 @@ Cloud Hypervisor owns KVM/vCPU/device execution. [Memory](memory.md),
 policies. Patches implement the VMM side, including cumulative checkpoint change
 tracking; they do not promise arbitrary upstream-version snapshot compatibility.
 
-The current series targets Cloud Hypervisor **v51.1** and retains the Host Linux **5.10** baseline. Patches 0001–0008 supply external RAM/UFFD, vsock and lifecycle barriers; 0009 preserves ARM registers; 0010/0011 backport restore-order/seccomp fixes; 0012 adds cumulative checkpoint-memory changes. Most other VMM paths use upstream behavior.
+The current series targets Cloud Hypervisor **v51.1** and retains the Host Linux **5.10** baseline. Patches 0001–0008 supply external RAM/UFFD, vsock and lifecycle barriers; 0009 preserves ARM registers; 0010/0011 backport restore-order/seccomp fixes; 0012 adds cumulative checkpoint-memory changes; 0013 synchronizes vhost-user block capacity; 0014 releases TAP queues from a paused VM before terminal exit. Most other VMM paths use upstream behavior.
 
 <a id="patch-purpose"></a>
 
 ## Why patches are required
 
-The platform has four requirements beyond the pinned upstream VMM behavior:
+The platform has the following requirements beyond the pinned upstream VMM behavior:
 
 1. **Externally owned sandbox RAM**: the host process (`sandbox-ctl`) owns the
    memfd inode. CH maps that same inode through an inherited descriptor rather
@@ -39,6 +39,11 @@ The platform has four requirements beyond the pinned upstream VMM behavior:
    shutdown must not lose vCPU kicks under a numeric `cpu.max` and host contention.
    Old acknowledgements from vCPUs or virtio workers must not cause premature
    completion or indefinite waits.
+5. **Late disk binding**: a reserved zero-capacity block device must expose the
+   bound disk's capacity through notifications or guest-initiated configuration
+   reads, and preserve that device state in snapshots.
+6. **Terminal TAP release**: a retiring, paused VM must release its host TAP
+   queues without resuming guest execution or processing queued packets.
 
 The pinned upstream interface does not directly provide this combination. The
 second requirement is particularly important: the platform needs to own fault
@@ -51,10 +56,14 @@ Patch 0004 may skip redundant inode punching, never the required REMOVE ([0004 �
 
 ## Patch scope and future evolution
 
-Each patch owns a complete intent, its corrections and its tests. Old numbers in
-this table refer to the original twelve-patch series restored by #377. The
+Each patch owns a complete intent, its corrections and its tests. For 0001–0011,
+old numbers in this table refer to the original twelve-patch series restored by #377. The
 first eleven patches retain the #379 maintenance scope. Patch 0012 owns the
 complete cumulative memory log; UFFD adoption retains the original ACK.
+
+The former capacity patches 0013 and 0014 are combined as 0013; the former TAP
+release patch 0015 is renumbered to 0014. This organization preserves the applied
+source and the formal first-eleven-patch compatibility baseline.
 
 | Patch | Purpose and scope | Origin | Future maintenance and removal condition |
 | --- | --- | --- | --- |
@@ -70,6 +79,8 @@ complete cumulative memory log; UFFD adoption retains the original ACK.
 | 0010 | Restore clock, then devices, then vCPUs | Old 0012 | Temporary upstream backport. Remove when the pinned release includes the fix and restore-order validation passes. |
 | 0011 | Restricted HTTP allocator reads and mapping growth, with real BPF tests | Upstream seccomp fixes adapted to v51.1 | Temporary upstream backport. Remove after equivalent permissions and positive/negative filter tests pass on the selected release. |
 | 0012 | Lifetime CPU/CH dirty ledger, raw writers, initialization, cumulative API and tests | Dirty-only parts of withdrawn #375, adapted to #379 | Maintain the fixed-baseline API locally while discussing an upstream interface. Align raw writers with upstream 3777ba8d; retire equivalent portions only after source and integration verification. |
+| 0013 | Vhost-user block capacity notifications, zero-capacity refresh and device snapshot state | Capacity patches from [#447](https://github.com/kuasar-sandbox/sandboxer/pull/447) and [#451](https://github.com/kuasar-sandbox/sandboxer/pull/451), combined | Maintain as one block-device capability. Replace only when the selected upstream implementation preserves notification and read/snapshot refresh, generation consistency and the guest-kernel contract. |
+| 0014 | Release TAP queues from a paused terminal VM | Former 0015, renumbered without code changes | Maintain the terminal API independently of resumable worker barriers. Retire after an equivalent upstream mechanism and its host caller are integrated and verified. |
 
 The upstream audit is pinned to
 [`0674238bb`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/0674238bb09082dfe55a4d3215eebf35ee0f5bb1)
@@ -88,7 +99,7 @@ CH used by #374 remains a frozen, distinct artifact.
   of accumulating fixup patches. Preserve original authorship, upstream links and
   sign-offs; do not attribute local additions to an upstream author.
 - Verify pure reorganization by comparing complete applied source trees. Record
-  intentional behavioral deltas separately: this maintenance revision changes
+  intentional behavioral deltas separately. Earlier functional corrections cover
   release notification/order, preservation of released zeros in capture, the ARM
   SVE capability guard, and HTTP allocator seccomp permissions.
 
@@ -783,6 +794,63 @@ patches via the existing native build recipe. On both native CI architectures it
 checks legacy cold capture and four-entry native snapshots restored by that CH,
 including one-time capability discovery, release and reuse. The helper records
 its applied source tree, patch hashes and binary hash; it is not a product VMM.
+
+<a id="patch-0013"></a>
+
+### 0013 — synchronize vhost-user block capacity
+
+A reserved block device without a configured size starts with zero capacity. Binding a disk changes the
+backend capacity while retaining the existing guest device. The patch maintains
+the VMM's capacity view through two paths:
+
+- When `BACKEND_REQ` is negotiated, a backend configuration-change notification
+  causes `GET_CONFIG`, updates the cached capacity, and raises a virtio
+  configuration interrupt.
+- While the cached capacity is zero, reading the capacity field or capturing the
+  device snapshot refreshes it with `GET_CONFIG`. This covers delayed or absent
+  notifications, including restored devices whose saved protocol features lack
+  `BACKEND_REQ`. Once capacity is nonzero, these reads use the cache; ordinary
+  block I/O does not acquire a new configuration-query step.
+
+Both paths serialize the backend query and cache update under the same connection
+lock. Capacity and its generation are updated together; actual changes advance
+the wrapping generation, while duplicate notifications leave it unchanged.
+The PCI `config_generation` register lets the guest detect and retry a split
+capacity read. Device snapshots preserve the current capacity and generation;
+older snapshots without the generation field default to zero. A refresh failure
+during a guest read is logged and leaves the cached value available; a refresh
+failure during snapshot capture fails that capture.
+
+The companion [Guest Runtime change #134](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
+adds a Linux virtio-blk configuration reread when opening a zero-capacity device.
+Together, the guest and VMM paths allow first access to discover a bound disk
+without an active notification channel. Host binding completion does not wait
+for a guest ACK. This patch owns block-device configuration state; cumulative
+RAM changes remain owned by 0012.
+
+Keep notification, read/snapshot refresh, generation handling and their
+corrections together when updating CH. An upstream replacement must preserve
+those behaviors with the companion guest kernel before this patch is removed.
+
+<a id="patch-0014"></a>
+
+### 0014 — release TAP queues from a paused terminal VM
+
+`PUT /api/v1/vm.reset-tap` accepts an already paused VM. It stops the virtio-net
+workers without resuming the VM or processing queued packets, waits for those
+workers to exit, drops the device's TAP handles, and closes inherited TAP
+descriptors retained in the VM configuration.
+
+Once release begins, the VMM enters a terminal state, including on partial
+failure. After replying, its control thread parks rather than accepting another
+VM operation or running ordinary teardown. The managing process must terminate
+the VMM. This API is therefore for final retirement, not a resumable pause or
+guest device hot-unplug. It remains separate from 0008's reusable pause/resume
+handshake, even though both use the worker lifecycle helpers.
+
+The patch retains the paused-worker regression that checks exit without queue
+processing or resume. Replacing it requires an equivalent terminal TAP-release
+mechanism and a verified host call path.
 
 <a id="build"></a>
 
