@@ -29,6 +29,7 @@ func restorePresence(paths ...string) FieldPresence {
 
 func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	artifact := validPortableConfig()
+	artifact.Boot.Cmdline = "loglevel=3"
 	artifact.Metadata = map[string]string{"owner": "artifact"}
 	before, err := MarshalPortableSandboxConfig(artifact)
 	if err != nil {
@@ -42,6 +43,9 @@ func TestApplyRestoreRulesUsesReferencedSandboxAsImmutableC0(t *testing.T) {
 	}
 	if runtime.Boot.Kernel != "" || runtime.Boot.Runtime != host.Boot.Runtime {
 		t.Fatalf("host bindings were not applied: %+v", runtime.Boot)
+	}
+	if runtime.Boot.Cmdline != artifact.Boot.Cmdline || c0.Boot.Cmdline != artifact.Boot.Cmdline {
+		t.Fatalf("restore changed captured cmdline: runtime=%q C0=%q", runtime.Boot.Cmdline, c0.Boot.Cmdline)
 	}
 	if runtime.Boot.Root.DiffTemplate != host.Boot.Root.DiffTemplate {
 		t.Fatalf("active diff binding = %q", runtime.Boot.Root.DiffTemplate)
@@ -109,6 +113,10 @@ func TestApplyRestoreRulesRejectsColdOnlyConfiguration(t *testing.T) {
 		mutate   func(*SandboxConfig)
 		want     string
 	}{
+		{name: "explicit empty cmdline", presence: restorePresence("boot.cmdline"), want: "boot.cmdline is cold-start-only"},
+		{name: "cmdline without presence", mutate: func(c *SandboxConfig) {
+			c.Boot.Cmdline = "loglevel=4"
+		}, want: "boot.cmdline is cold-start-only"},
 		{name: "present launch", presence: restorePresence("launch"), want: "launch is cold-start-only"},
 		{name: "persistent files", mutate: func(c *SandboxConfig) {
 			c.Files = []FileConfig{{Path: "/etc/value", Content: "persistent"}}

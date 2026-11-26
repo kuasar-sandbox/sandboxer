@@ -152,7 +152,7 @@ selector，Apply 后即可关闭 source；返回结果中的 storage 仍为借�
 再将返回的 shape 和同一个 launch 值交给 `Start`，或依次调用 `StartRuntime`、
 `Launch`。Derive 读取磁盘容量，冻结已打开 source 的 identity、输入的 portable boot refs
 与选定的 host boot 路径，不打开 host kernel/runtime 文件。`StartRuntime` 解析目标
-组件，`Launch` 使用这些组件的 identity 派生新 C0，同时保留 source 工作负载和磁盘图。
+组件，`Launch` 使用这些组件的 identity 和 runtime 实际选定的 cmdline 派生新 C0，同时保留 source 工作负载和磁盘图。
 Apply 后改变来源 provenance 或输入 boot refs、Derive 后改变 host boot 路径，都会被拒绝。
 复制返回值会保留绑定；用 `LaunchSpecFromConfig` 重建公开字段不会。
 完整的 Apply 结果也可以在并非由该 source 派生 shape 的基础 Runtime 上启动。
@@ -160,7 +160,7 @@ Apply 后改变来源 provenance 或输入 boot refs、Derive 后改变 host boo
 `ReplaceBoot` 使用完整的显式 cold boot graph，并据此派生 C0。
 来源记录不额外持有 reader、storage 或 checkpoint pin。
 
-`RuntimeSpec` 包含 kernel/Bundle 绑定、CPU/内存及资源策略、宿主
+`RuntimeSpec` 包含 kernel/Bundle 绑定、额外内核 cmdline、CPU/内存及资源策略、宿主
 TAP/provider/namespace 要求、console/control 设置和有序的 `RuntimeDiskSpec`。
 每个逻辑盘固定名称、single/overlay 布局和逻辑容量。Overlay 展开为只读 base 加
 可写 upper，single 展开为一个可写设备。所有设备固定使用既有最小 virtio feature

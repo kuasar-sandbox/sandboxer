@@ -184,7 +184,7 @@ Size 是 `512MiB` 等字节大小字符串；duration 是 `30s` 等 Go duration 
 | `network.interface` | String；有 source 时 `eth0` | 无网络 source 时所有 Guest 网络字段必须为空 |
 | `boot.kernel` | 本地绝对 `file://` 引用 | 冷启动 kernel binding；内存恢复接受但忽略此字段，不依赖外部 kernel。冷启动身份/sidecar 规则见 [Runtime](runtime_zh.md#runtime-sdk) |
 | `boot.runtime` | 本地绝对 `file://` 引用 | Runtime Bundle binding；恢复匹配捕获的 digest scheme 和 footer 声明摘要，不比较 basename。原 basename 仅用于同目录候选查找；见[选择规则](runtime_zh.md#restore) |
-| `boot.cmdline` | String；空 | 与自动启动参数合并的额外参数；仅供冷启动 Host 输入 |
+| `boot.cmdline` | String；空 | 原样追加在自动启动参数之后的额外参数；仅供冷启动 Host 输入 |
 | `boot.root.base` | Artifact ref；single-disk 模式可省略 | Overlay 模式必须的 EROFS lower；single-disk 模式可选 ext4 lower |
 | `boot.root.overlay` | Object；省略选择 single disk | 存在时选择独立只读 lower 和可写 ext4 upper |
 | `boot.root.diff`、`boot.root.diff_template`、`boot.root.base_from_refs` | Local ref、模板引用、有序 ref list | 仅 single-disk 的可写绑定、provisioning template 和 lower chain；与 overlay 互斥 |
@@ -322,12 +322,14 @@ Capture 命令的 `--timeout` 由 [Runtime 操作](runtime_zh.md#snapshot)单独
 
 | Owner | Fields |
 |---|---|
-| Artifact strong | root/data immutable graph, disk count/order/name, topology, self position, cmdline |
+| Artifact strong | root/data immutable graph, disk count/order/name, topology, self position |
 | Host strong | kernel/runtime actual path, active diff/template, cgroup/controller, network provider, timeout, usage, manifest/crypto/ref-location, CH binary |
-| Persistent override allowed | resources workload defaults, launch, mounts, files, init, metadata |
+| Persistent override allowed | `boot.cmdline`, resources workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
 受保护字段有冲突时明确报出 field context. Host不能通过省略或 YAML merge静默改变 disk graph. Persistent `mounts` 可以修改普通 tmpfs/empty mount 的声明,但 data-disk mount 的 source、target、subpath 和顺序 必须保持 artifact topology,不能借 mount override移动磁盘.
+
+`boot.cmdline` 随目标 kernel 一起选择：省略时继承源 E 的额外参数，显式空字符串清除它们，非空字符串替换它们。选定的字符串写入新 C0 和后续导出制品，不与源 E 的额外参数累加。Sandboxer 将其原样追加在自动启动参数之后，保留引号、空白与顺序；重复参数遵循对应 Linux 参数的语义。内存恢复拒绝显式提供 `boot.cmdline`，并保留捕获的参数值。
 
 Network必须满足:
 
@@ -338,7 +340,7 @@ portable interface       == explicitly supplied host interface
 
 Direct EROFS E只有 read-only image. 目标 host必须提供可用 `diff_template`（含 `mkfs://ext4?size=...`），或已格式化的 explicit diff. 缺少可挂载 upper时在 controller/network/CH side effect 前失败.
 
-最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`. 从来源派生的冷启动解析目标 kernel/runtime 身份，并将其写入新 C0，同时保留生效的来源工作负载与磁盘图。来源 boot 身份不要求冷启动继续使用旧 kernel/runtime，也不放宽上面的受保护字段。内存恢复则保留捕获的 C0，需要兼容的本地 runtime 绑定，但不依赖外部 kernel。
+最终调用普通 `sandbox.Run`;`run --from` 不进入 `restore.Run`. 从来源派生的冷启动解析目标 kernel/runtime 身份，并将其与选定的 cmdline 一起写入新 C0，同时保留生效的来源工作负载与磁盘图。来源 boot 身份不要求冷启动继续使用旧 kernel/runtime，也不放宽上面的受保护字段。内存恢复则保留捕获的 C0，需要兼容的本地 runtime 绑定，但不依赖外部 kernel。
 
 默认 `run --from` 继续执行上述强 ownership rules. `--replace-boot` 只选择另一条显式、原子的 cold derivation:
 

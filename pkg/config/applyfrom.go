@@ -134,6 +134,9 @@ func cloneRootConfig(in RootConfig) RootConfig {
 }
 
 func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) {
+	if presence.Has("boot.cmdline") {
+		c0.Boot.Cmdline = host.Boot.Cmdline
+	}
 	if presence.Has("resources.capacity.cpu") {
 		c0.Resources.Capacity.CPU = host.Resources.Capacity.CPU
 	}
@@ -205,9 +208,6 @@ func applyPersistentFromOverrides(c0 *PortableSandboxConfig, host *SandboxConfig
 }
 
 func validateFromProtectedFields(artifact *PortableSandboxConfig, host *SandboxConfig, presence FieldPresence) error {
-	if presence.Has("boot.cmdline") && host.Boot.Cmdline != artifact.Boot.Cmdline {
-		return errors.New("run --from: boot.cmdline is owned by the Sandbox artifact")
-	}
 	if presence.Has("mounts") {
 		if err := validateFromDiskMountTopology(artifact.Mounts, host.Mounts, artifact.slotNames()); err != nil {
 			return err
