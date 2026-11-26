@@ -165,6 +165,10 @@ func TestRunSourceColdUsesTargetBootForRunStartAndSplit(t *testing.T) {
 				shape.Bundle = "file://" + targetRuntime
 				host.Boot.Runtime = shape.Bundle
 				cfg, launch := applyIdentitySource(t, source, host, false)
+				// The target Runtime can select boot parameters independently of
+				// the source baseline, including with the split/unbound API.
+				cfg.Boot.Cmdline = `loglevel=4 sandbox.test="two  words"`
+				shape.Cmdline = cfg.Boot.Cmdline
 				inputBefore, err := config.MarshalPortableSandboxConfig(launch.PortableConfig)
 				if err != nil {
 					t.Fatal(err)
@@ -175,6 +179,7 @@ func TestRunSourceColdUsesTargetBootForRunStartAndSplit(t *testing.T) {
 				}
 				want.Boot.Kernel = testKernelRef(filepath.Base(kernel), kernelDigest)
 				want.Boot.Runtime = testKernelRef(filepath.Base(targetRuntime), runtimeDigest)
+				want.Boot.Cmdline = cfg.Boot.Cmdline
 				watch := watchArtifactAccess(t, kernel)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -226,7 +231,7 @@ func TestRunSourceColdUsesTargetBootForRunStartAndSplit(t *testing.T) {
 				}
 				wantRaw, err := config.MarshalPortableSandboxConfig(want)
 				if err != nil || !bytes.Equal(gotRaw, wantRaw) {
-					t.Fatalf("derived C0 changed more than target boot identities: %s, want %s (error %v)", gotRaw, wantRaw, err)
+					t.Fatalf("derived C0 changed more than target boot values: %s, want %s (error %v)", gotRaw, wantRaw, err)
 				}
 				inputAfter, err := config.MarshalPortableSandboxConfig(launch.PortableConfig)
 				if err != nil || !bytes.Equal(inputBefore, inputAfter) {

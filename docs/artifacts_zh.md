@@ -433,7 +433,7 @@ file://<digest>.overlay@digest:<digest>
 目标 host 通过实际 path、source directory 或 named ref-location 解析磁盘引用。启动组件策略取决于启动方式：
 
 - 所有冷启动都使用目标 host 选定的 kernel/runtime。有效的 `<configured-kernel-path>.sha256` sidecar 提供 kernel identity；sidecar 缺失时，在 CH 启动前对原始 kernel 完整计算一次 hash。runtime Bundle 提供其声明的 footer identity。
-- 冷启动 `run --from` 与 SDK 的 `RunSource.Apply` 路径使用目标身份派生新的 C0，同时保留来源 workload、磁盘图与 ancestry。源 E 不变；其旧 boot identity 不约束新冷启动。
+- 冷启动 `run --from` 与 SDK 的 `RunSource.Apply` 路径使用目标身份和实际 runtime cmdline 派生新的 C0，同时保留来源 workload、磁盘图与 ancestry。省略 `boot.cmdline` 时继承 E 的额外参数；显式字符串替换它们，空字符串清除它们。新 C0 与后续导出制品保留选定参数，不与源值累加。源 E 不变；其旧 boot identity 不约束新冷启动。
 - 内存 restore 保持原 C0，并恢复捕获的 kernel；不要求、打开或 hash 外部 kernel，也不读取 kernel sidecar。外部 runtime 必须按 **digest scheme 和 digest** 匹配 C0；序列化的 basename 只是查找提示，配置的文件可以改名。
 
 源 E 冷启动的身份重投影要求保留 `RunSource.Apply` 返回的原始 `LaunchSpec`；

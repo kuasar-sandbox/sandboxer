@@ -202,7 +202,7 @@ reservation protocol and failure behavior are defined in [resources](resources.m
 | `network.interface` | String; `eth0` when a source exists | Without a network source all guest network fields must be empty |
 | `boot.kernel` | Local absolute `file://` reference | Cold-start kernel binding; accepted but ignored on memory restore, which needs no external kernel. Cold identity/sidecar rules: [Runtime](runtime.md#runtime-sdk) |
 | `boot.runtime` | Local absolute `file://` reference | Runtime Bundle binding; restore matches the captured digest scheme and declared footer digest, not the basename. The original basename is a sibling-lookup hint; [selection](runtime.md#restore) |
-| `boot.cmdline` | String; empty | Extra arguments merged with automatic boot arguments; cold-only host input |
+| `boot.cmdline` | String; empty | Extra arguments appended verbatim after automatic boot arguments; cold-only host input |
 | `boot.root.base` | Artifact reference; optional in single-disk mode | Required EROFS lower in overlay mode; optional ext4 lower in single-disk mode |
 | `boot.root.overlay` | Object; omitted selects single disk | Presence selects separate read-only lower and writable ext4 upper |
 | `boot.root.diff`, `boot.root.diff_template`, `boot.root.base_from_refs` | Local reference, template reference, ordered ref list | Single-disk-only writable binding, provisioning template and lower chain; mutually exclusive with overlay |
@@ -348,12 +348,14 @@ explicit policy choice, not as the product default.
 
 | Owner | Fields |
 |---|---|
-| Artifact strong | Immutable root/data graph, disk count/order/name, topology, self position, cmdline |
+| Artifact strong | Immutable root/data graph, disk count/order/name, topology, self position |
 | Host strong | Actual kernel/runtime paths, active diff/template, cgroup/controller, network provider, timeouts, usage, Manifest/crypto/ref-location, CH binary |
-| Persistent override allowed | Resource workload defaults, launch, mounts, files, init, metadata |
+| Persistent override allowed | `boot.cmdline`, resource workload defaults, launch, mounts, files, init, metadata |
 | Instance-only | IP/MAC/hostname, ephemeral files/env, stdio/forward |
 
 Conflicts with protected fields return explicit field context. Hosts cannot silently change disk graphs through omission or YAML merging. Persistent `mounts` may change ordinary tmpfs/empty declarations, but data-disk mount sources, targets, names, and order must retain artifact topology. A mount override cannot move a disk.
+
+Select `boot.cmdline` with the target kernel: omission inherits the source E's extra arguments, an explicit empty string clears them, and a nonempty string replaces them. The selected string is stored in the new C0 and subsequent exports; it is never concatenated with the source E's extras. Sandboxer appends it verbatim after its automatic boot arguments, preserving quoting, whitespace, and order. Repeated parameters follow their Linux parameter semantics. Memory restore rejects an explicit `boot.cmdline` and retains the captured value.
 
 Networking must satisfy:
 
@@ -364,7 +366,7 @@ portable interface       == explicitly supplied host interface
 
 A direct EROFS E contains only a read-only image. The destination host must supply a `diff_template` (including `mkfs://ext4?size=...`) or an explicitly bound, already formatted diff. A missing mountable upper fails before controller/network/CH side effects.
 
-The final call is ordinary `sandbox.Run`; `run --from` does not enter `restore.Run`. The source-derived cold path resolves the target kernel/runtime identities and records them in a new C0 while preserving the effective source workload and disk graph. Source boot identities do not require an old kernel/runtime for cold startup; this does not relax the protected fields above. Memory restore instead preserves the captured C0 and requires a compatible local runtime binding, without an external kernel.
+The final call is ordinary `sandbox.Run`; `run --from` does not enter `restore.Run`. The source-derived cold path resolves the target kernel/runtime identities and records them with the selected cmdline in a new C0 while preserving the effective source workload and disk graph. Source boot identities do not require an old kernel/runtime for cold startup; this does not relax the protected fields above. Memory restore instead preserves the captured C0 and requires a compatible local runtime binding, without an external kernel.
 
 Default `run --from` continues to enforce these strong ownership rules. `--replace-boot` selects a separate, explicit, atomic cold derivation:
 

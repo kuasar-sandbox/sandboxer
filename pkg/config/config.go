@@ -528,8 +528,8 @@ func mergeIPMask(metaIP, cfgIP string) string {
 // BootConfig is everything the kernel needs to start: kernel image,
 // extra cmdline, sandbox-runtime image, and the rootfs (base + COW
 // overlay). The init parameters and rootfs mount options are auto-
-// injected by sandbox-ctl; user only provides extras like console=
-// and ip= via cmdline.
+// injected by sandbox-ctl; user only provides extras like loglevel=
+// and printk.time= via cmdline.
 type BootConfig struct {
 	Kernel  string     `yaml:"kernel"`  // file:// only (cold-start)
 	Cmdline string     `yaml:"cmdline"` // user extras; merged with auto-injected base

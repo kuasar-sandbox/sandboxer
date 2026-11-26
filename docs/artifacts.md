@@ -485,7 +485,7 @@ file://<digest>.overlay@digest:<digest>
 The destination host resolves disk refs through actual paths, a source directory, or named ref-locations. Boot component policy depends on how the sandbox starts:
 
 - Every cold startup uses the selected target kernel/runtime. A valid `<configured-kernel-path>.sha256` sidecar supplies kernel identity; when absent, the raw kernel is hashed once before CH starts. The runtime Bundle supplies its declared footer identity.
-- Cold `run --from` and the SDK `RunSource.Apply` path derive a new C0 with those target identities while retaining the source workload, disk graph and ancestry. The source E is unchanged; its old boot identities do not constrain a new cold boot.
+- Cold `run --from` and the SDK `RunSource.Apply` path derive a new C0 with those target identities and the actual runtime cmdline while retaining the source workload, disk graph and ancestry. Omitted `boot.cmdline` inherits E's extras; an explicit string replaces them, including an empty string to clear them. The new C0 and subsequent exports retain the selected extras without accumulating the source value. The source E is unchanged; its old boot identities do not constrain a new cold boot.
 - Memory restore preserves the original C0 and resumes the captured kernel. It does not require, open, or hash an external kernel or read a kernel sidecar. Its external runtime must match C0 by **digest scheme and digest**; the serialized basename is only a lookup hint, so the configured file may have a different name.
 
 The source-cold reprojection requires the original `LaunchSpec` returned by

@@ -104,6 +104,71 @@ boot:
 	}
 }
 
+func TestApplyFromRulesCmdlinePresencePersistsAcrossExport(t *testing.T) {
+	const sourceCmdline = `loglevel=3 sandbox.source="old value"`
+	const replacement = `loglevel=4 panic=0 sandbox.test="two  words"`
+	for _, tc := range []struct {
+		name, field, want string
+	}{
+		{name: "omitted inherits", want: sourceCmdline},
+		{name: "empty clears", field: "  cmdline: \"\"\n", want: ""},
+		{name: "nonempty replaces", field: "  cmdline: '" + replacement + "'\n", want: replacement},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			artifact := portableFromFixture()
+			artifact.Boot.Cmdline = sourceCmdline
+			before, err := MarshalPortableSandboxConfig(artifact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			host, presence, err := LoadConfigBytesWithPresence([]byte(`
+network: {tap: tap0}
+boot:
+  kernel: file:///node/new-vmlinux
+  runtime: file:///node/runtime
+` + tc.field + `  root:
+    overlay: {diff_template: file:///node/upper.ext4}
+`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime, c0, err := ApplyFromRules(artifact, host, presence, ApplyFromOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.Boot.Kernel != host.Boot.Kernel || runtime.Boot.Cmdline != tc.want || c0.Boot.Cmdline != tc.want {
+				t.Fatalf("selected boot: runtime=%+v C0.cmdline=%q, want target kernel with cmdline %q", runtime.Boot, c0.Boot.Cmdline, tc.want)
+			}
+			after, err := MarshalPortableSandboxConfig(artifact)
+			if err != nil || string(after) != string(before) {
+				t.Fatal("cmdline override mutated the source Sandbox", err)
+			}
+			c1, err := c0.Exported("file://source.sandbox@digest:"+testSHA, nil, []bool{false})
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := MarshalPortableSandboxConfig(c1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exported, err := ParsePortableSandboxConfig(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exported.Boot.Cmdline != tc.want {
+				t.Fatalf("exported cmdline = %q, want %q", exported.Boot.Cmdline, tc.want)
+			}
+			nextRuntime, nextC0, err := ApplyFromRules(exported, host, presence, ApplyFromOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if nextRuntime.Boot.Cmdline != tc.want || nextC0.Boot.Cmdline != tc.want {
+				t.Fatalf("cold start after export accumulated cmdline: runtime=%q C0=%q, want %q", nextRuntime.Boot.Cmdline, nextC0.Boot.Cmdline, tc.want)
+			}
+		})
+	}
+}
+
 func TestApplyFromRulesRejectsProtectedDiskGraph(t *testing.T) {
 	tests := []struct {
 		name string
@@ -127,15 +192,6 @@ boot:
   root:
     diff_template: file:///single.ext4
 `, want: "active diff fields under boot.root.overlay"},
-		{name: "cmdline", yaml: `
-network: {tap: tap0}
-boot:
-  kernel: file:///node/vmlinux
-  runtime: file:///node/runtime
-  cmdline: changed=true
-  root:
-    overlay: {diff_template: file:///upper.ext4}
-`, want: "boot.cmdline is owned"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -173,7 +173,8 @@ then use the returned shape and the same launch value with `Start`, or with
 `StartRuntime` followed by `Launch`. Derivation reads disk capacities and freezes
 the opened source identity, input portable boot refs and selected host boot paths;
 it does not open host kernel/runtime files. `StartRuntime` resolves the target
-components, and `Launch` derives a new C0 with their identities while preserving
+components, and `Launch` derives a new C0 with their identities and the runtime's
+selected cmdline while preserving
 the source workload and disk graph. Changing source provenance or input boot refs
 after Apply, or host boot paths after derivation, is rejected. Copying the returned
 value preserves this binding; reconstructing public fields with
@@ -184,7 +185,7 @@ matching host identities. `ReplaceBoot` uses a complete explicit cold boot graph
 and derives C0 from it. The retained source record owns no additional readers,
 storage or checkpoint pins.
 
-`RuntimeSpec` contains kernel/Bundle bindings, CPU/memory and resource policy,
+`RuntimeSpec` contains kernel/Bundle bindings, the extra kernel cmdline, CPU/memory and resource policy,
 host TAP/provider/namespace requirements, console/control settings and ordered
 `RuntimeDiskSpec` entries. Each logical disk fixes its name, single/overlay
 layout and logical capacities. Overlay expands to a read-only base followed by

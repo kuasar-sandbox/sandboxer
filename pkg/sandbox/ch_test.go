@@ -242,7 +242,8 @@ func TestCHCommand_NoBalloonWhenAllocEqualsCapacity(t *testing.T) {
 
 func TestBuildCmdline_ContainsAutoInjectedAndUserExtras(t *testing.T) {
 	cfg := makeMinimalCfg()
-	cfg.Boot.Cmdline = "console=hvc0 ip=169.254.1.1::169.254.1.0:255.255.255.254:sb1:eth0:off"
+	const extras = `printk.time=1 panic=0 sandbox.test="two  words"`
+	cfg.Boot.Cmdline = extras
 
 	cl := buildCmdline(cfg)
 	for _, want := range []string{
@@ -251,7 +252,7 @@ func TestBuildCmdline_ContainsAutoInjectedAndUserExtras(t *testing.T) {
 		"rootfstype=erofs",
 		"rootflags=dax=always",
 		"console=hvc0",
-		"ip=169.254.1.1",
+		"printk.time=1",
 	} {
 		if !strings.Contains(cl, want) {
 			t.Errorf("cmdline missing %q\n  got: %s", want, cl)
@@ -262,6 +263,12 @@ func TestBuildCmdline_ContainsAutoInjectedAndUserExtras(t *testing.T) {
 	}
 	if hasCmdlineToken(cl, "dax=always") {
 		t.Errorf("cmdline must not contain bare EROFS mount option: %s", cl)
+	}
+	if !strings.HasSuffix(cl, " "+extras) || cfg.Boot.Cmdline != extras {
+		t.Fatalf("cmdline extras were rewritten instead of appended verbatim: %q", cl)
+	}
+	if !hasCmdlineToken(cl, "panic=-1") || strings.Index(cl, "panic=-1") >= strings.Index(cl, "panic=0") {
+		t.Fatalf("automatic panic policy must precede user extras: %q", cl)
 	}
 	for _, banned := range []string{"sandbox.app", "sandbox.args"} {
 		if strings.Contains(cl, banned) {
