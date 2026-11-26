@@ -343,7 +343,8 @@ jobs:
               make vet
             fi
             bash /inputs/release/ci/native-cache/native-cache.sh restore-or-build cloud-hypervisor
-            make build
+            make build BUILD_VERSION='${{ needs.preflight.outputs.version }}'
+            if [ -f internal/version/version.go ]; then make check-version BUILD_VERSION='${{ needs.preflight.outputs.version }}'; fi
             export SOURCE_DATE_EPOCH
             SOURCE_DATE_EPOCH=$(git show -s --format=%ct '${{ needs.preflight.outputs.source_sha }}')
             RELEASE_SOURCE_ROOT="$PWD" bash /inputs/release/.ci/component-packaging/scripts/release.sh package '${{ needs.preflight.outputs.version }}' "$TARGET_ARCH" release-bundle

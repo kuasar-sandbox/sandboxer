@@ -34,6 +34,12 @@ endif
 # ---------------------------------------------------------------------------
 GO             := go
 GO_BUILD_FLAGS := -trimpath
+# Version is explicitly supplied by release builds; ordinary builds are dev.
+BUILD_VERSION ?= dev
+VERSION_TAG := $(shell git tag --points-at HEAD --list 'v[0-9]*' --sort=refname 2>/dev/null | \
+	grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$$' | \
+	awk -v preferred="$(BUILD_VERSION)" 'NR == 1 { first = $$0 } $$0 == preferred { exact = $$0 } END { print (exact != "" ? exact : first) }')
+VERSION_LDFLAGS := -X github.com/kuasar-sandbox/sandboxer/internal/version.releaseVersion=$(BUILD_VERSION) -X github.com/kuasar-sandbox/sandboxer/internal/version.gitTag=$(VERSION_TAG)
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 E2E_FIXTURE_DIR ?= $(abspath build/e2e-tools/$(TARGET_ARCH))
@@ -65,7 +71,7 @@ build: sandbox-ctl cloud-hypervisor
 
 sandbox-ctl:
 	@mkdir -p "$(BINDIR)"
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/sandbox-ctl" ./cmd/sandbox-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -o "$(BINDIR)/sandbox-ctl" ./cmd/sandbox-ctl
 	$(call link_bin,sandbox-ctl)
 
 native-deps:
@@ -158,7 +164,7 @@ release:
 	connector_tag="$(CONNECTOR_VERSION)"; runtime_tag="$(RUNTIME_VERSION)"; \
 	workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
 		--root .. --owners sandboxer --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag" --dependency-tag "guest-runtime=$$runtime_tag")"; \
-	$(release_make) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
+	$(release_make) build GOWORK="$$workspace" BUILD_VERSION="$(VERSION)" BINDIR="$(abspath $(BINDIR))"; \
 	rm -rf "$(BUILD_DIR)/release-bundle"; \
 	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
 	RELEASE_SOURCE_ROOT="$(CURDIR)" \
@@ -185,3 +191,18 @@ help:
 	@echo "  test-release       test component release packaging"
 	@echo "  test / vet / clean"
 	@echo "  TARGET_ARCH        x86_64 (default) | aarch64"
+
+.PHONY: check-version
+# Verify the newly built clean release binaries on their native architecture.
+check-version:
+	@test "$(HOST_ARCH)" = "$(TARGET_ARCH)"
+	@set -e; source="$(VERSION_TAG)"; \
+	if [ -z "$$source" ]; then source="$$(git rev-parse HEAD | cut -c1-12)"; fi; \
+	for name in sandbox-ctl; do \
+	  binary="$(BINDIR)/$$name"; \
+	  actual="$$("$$binary" --version)"; \
+	  rc=0; "$$binary" --version unexpected >/dev/null 2>&1 || rc=$$?; \
+	  if [ "$$rc" -ne 2 ]; then echo "$$name accepted extra version arguments" >&2; exit 1; fi; \
+	  expected="$$name $(BUILD_VERSION) ($$source)"; \
+	  if [ "$$actual" != "$$expected" ]; then printf 'expected %s, got %s\n' "$$expected" "$$actual" >&2; exit 1; fi; \
+	done
