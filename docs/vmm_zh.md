@@ -10,13 +10,13 @@ Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor
 [内存](memory_zh.md)、[资源](resources_zh.md)和 [Runtime](runtime_zh.md)分别定义 Host 策略。
 补丁实现 VMM 一侧的契约，包括 checkpoint 内存变化累计记录，并不保证任意上游版本的快照互通。
 
-当前补丁系列以 Cloud Hypervisor **v51.1** 为目标，保留 Host Linux **5.10** 基线。0001–0008 提供外部 RAM/UFFD、vsock 与生命周期屏障，0009 保存 ARM 寄存器，0010/0011 回移 restore-order/seccomp 修复，0012 增加 checkpoint 内存变化累计记录。多数其他 VMM 路径沿用上游行为。
+当前补丁系列以 Cloud Hypervisor **v51.1** 为目标，保留 Host Linux **5.10** 基线。0001–0008 提供外部 RAM/UFFD、vsock 与生命周期屏障，0009 保存 ARM 寄存器，0010/0011 回移 restore-order/seccomp 修复，0012 增加 checkpoint 内存变化累计记录，0013 同步 vhost-user 块设备容量，0014 在已暂停 VM 最终退出前释放 TAP 队列。多数其他 VMM 路径沿用上游行为。
 
 <a id="patch-purpose"></a>
 
 ## 为什么需要 patch
 
-平台对 VMM 有四条非 upstream 的诉求:
+平台对 VMM 有以下超出所固定 upstream 行为的诉求:
 
 1. **外部托管 sandbox RAM**:host 进程(sandbox-ctl)持有 memfd inode,CH 通过
    继承 fd 把同一 inode mmap 到自己地址空间——而不是 CH 自己 `memfd_create`。
@@ -32,6 +32,10 @@ Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor
 4. **可靠 VM lifecycle**:pause、snapshot、resume 和 ordered shutdown 在数值
    `cpu.max` 与 host contention 下不能丢失 vCPU kick,也不能因 CPU 或 virtio
    worker 的旧 acknowledgement 提前返回或永久阻塞
+5. **磁盘延迟绑定**：预留的零容量块设备绑定磁盘后，需要通过通知或 Guest 主动读取
+   配置暴露实际容量，并在快照中保存该设备状态。
+6. **退役时释放 TAP**：已暂停且即将退役的 VM，需要在保持暂停、不处理排队报文的
+   情况下释放 Host TAP 队列。
 
 这些组合能力在所固定的 upstream CH 版本中未直接提供。第二条尤其本质——upstream uffd handler 模型
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
@@ -43,8 +47,11 @@ Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor
 
 ## 补丁范围与未来演进
 
-每项补丁包含完整意图、对应修正及测试。下表旧编号指 #377 恢复的原十二项补丁。
+每项补丁包含完整意图、对应修正及测试。下表 0001–0011 的旧编号指 #377 恢复的原十二项补丁。
 前十一项继续保持 #379 的维护范围。0012 独立维护完整累计内存日志；UFFD 接管继续使用原 ACK。
+
+原容量补丁 0013 和 0014 合并为 0013；原 TAP 释放补丁 0015 重编号为 0014。
+此整理保留应用后的源码，以及正式前十一项补丁组成的兼容基线。
 
 | 补丁 | 目的与范围 | 来源 | 未来维护及移除条件 |
 | --- | --- | --- | --- |
@@ -60,6 +67,8 @@ Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor
 | 0010 | 先恢复时钟，再设备，最后 vCPU | 旧 0012 | 临时上游回补。固定版本包含修复且恢复顺序验证通过后移除。 |
 | 0011 | HTTP allocator 受限读取与映射增长，含真实 BPF 测试 | 适配 v51.1 的上游 seccomp 修复 | 临时上游回补。选定版本具备等价权限且正反过滤测试通过后移除。 |
 | 0012 | CPU/CH 生命周期累计位图、原始写入、初始化、累计 API 及测试 | 已撤回 #375 的日志部分，适配 #379 | 固定基线 API 暂自行维护并推动上游接口讨论；原始写入对齐上游 3777ba8d。仅在等价源码及集成验证成立后移除对应部分。 |
+| 0013 | vhost-user 块设备容量通知、零容量刷新及设备快照状态 | 合并 [#447](https://github.com/kuasar-sandbox/sandboxer/pull/447) 和 [#451](https://github.com/kuasar-sandbox/sandboxer/pull/451) 的容量补丁 | 作为独立块设备能力维护。选定上游实现保留通知、读取/快照刷新、generation 一致性及 Guest 内核契约后再替换。 |
+| 0014 | 释放已暂停且即将退出 VM 的 TAP 队列 | 原 0015，仅重编号 | 与可恢复的 worker barrier 分开维护终态 API。等价上游机制及 Host 调用方完成集成验证后再移除。 |
 
 上游核对固定于 2026-10-29 的
 [`0674238bb`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/0674238bb09082dfe55a4d3215eebf35ee0f5bb1)。
@@ -73,8 +82,8 @@ Runtime 提供外部 RAM、协调暂停/恢复并控制设备；Cloud Hypervisor
 - 按顺序应用，每个前缀须可构建且完整实现已经声明的能力；配置随实际消费者引入。
 - 后续修复和回归测试并入功能所属补丁，不累积 fixup。保留原作者、上游链接及
   sign-off；不能将本地新增内容归给上游作者。
-- 比较完整应用后源码树验证纯整理的等价性，单独记录有意行为变化：本次为释放通知/
-  顺序、捕获保留释放零、ARM SVE capability 检查及 HTTP allocator seccomp 权限。
+- 比较完整应用后源码树验证纯整理的等价性，单独记录有意行为变化。此前功能修正包括
+  释放通知/顺序、捕获保留释放零、ARM SVE capability 检查及 HTTP allocator seccomp 权限。
 
 - 仓库相对 patch 路径:`native-deps/deps/ch-patches/*.patch`,按编号顺序应用
 - 在 `sandboxer/native-deps` 中执行 `make ch-patches-apply`(全新 `make cloud-hypervisor` 构建也会执行);
@@ -659,6 +668,49 @@ d1719ac8，相比 ad5f3eea 仅新增无关的迁移超时处理；继续固定 C
 常规 CI 的 `snapshot.ch-compat` 通过既有原生构建脚本，从正式前十一项补丁构建仅用于
 测试的 CH。两种原生架构均验证旧 CH 冷捕获和新四条目快照由旧 CH 恢复，包括一次性
 能力识别、释放与重用。helper 记录应用后源码 tree、补丁及二进制哈希，不作为产品 VMM。
+
+<a id="patch-0013"></a>
+
+### 0013 — 同步 vhost-user 块设备容量
+
+未指定大小的预留块设备初始容量为零。绑定磁盘后，后端容量发生变化，Guest 中仍使用原有设备。
+补丁通过两条路径维护 VMM 的容量视图：
+
+- 已协商 `BACKEND_REQ` 时，后端配置变化通知触发 `GET_CONFIG`，更新缓存容量，
+  并向 Guest 发出 virtio 配置中断。
+- 缓存容量仍为零时，读取容量字段或捕获设备快照会通过 `GET_CONFIG` 刷新容量。
+  这覆盖通知延迟或缺失，包括保存的协议特性中没有 `BACKEND_REQ` 的恢复态设备。
+  容量非零后，这些读取使用缓存；普通块 I/O 不增加配置查询步骤。
+
+两条路径在同一连接锁内完成后端查询和缓存更新，避免并发刷新把旧结果写回。
+容量及其 generation 一起更新：容量实际变化时 generation 循环递增，重复通知不递增。
+PCI `config_generation` 寄存器让 Guest 能识别分段读取期间的容量变化并重试。
+设备快照保存当前容量和 generation；缺少 generation 字段的旧快照按零读取。
+Guest 读取时刷新失败会记录错误并继续提供缓存值；捕获快照时刷新失败则使本次捕获失败。
+
+配套的 [Guest Runtime #134](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
+让 Linux virtio-blk 在打开零容量设备时重新读取配置。Guest 和 VMM 两端配合，
+使首次访问能够在没有主动通知通道时发现已绑定磁盘。Host 绑定完成不等待 Guest ACK。
+本补丁负责块设备配置状态；RAM 变化累计记录仍归 0012。
+
+升级 CH 时，将通知、读取/快照刷新、generation 及其后续修正作为同一功能维护。
+上游替代实现须与配套 Guest 内核共同保留上述行为，才能移除此补丁。
+
+<a id="patch-0014"></a>
+
+### 0014 — 释放已暂停且即将退出 VM 的 TAP 队列
+
+`PUT /api/v1/vm.reset-tap` 仅接受已暂停的 VM。它在保持 VM 暂停、不处理排队报文的
+情况下停止 virtio-net worker，等待其退出，再释放设备持有的 TAP handle，并关闭
+VM 配置保留的继承 TAP fd。
+
+释放开始后，VMM 进入终态，部分失败也不例外。回复请求后，控制线程停驻，
+不再接受其他 VM 操作或执行普通析构；管理进程必须终止该 VMM。因此该 API 用于最终
+退役，不能用于可恢复的暂停或 Guest 设备热拔插。它与 0008 的可重复 pause/resume
+握手分开维护，虽然二者使用共同的 worker 生命周期 helper。
+
+补丁保留暂停态 worker 在不处理队列、不恢复运行时退出的回归测试。替换此补丁需要
+等价的终态 TAP 释放机制，以及经过验证的 Host 调用路径。
 
 <a id="build"></a>
 
