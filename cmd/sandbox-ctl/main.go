@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/kuasar-sandbox/sandboxer/internal/version"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
 
@@ -44,6 +45,9 @@ func init() {
 }
 
 func main() {
+	if version.PrintIfRequested("sandbox-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		printUsage(os.Stderr)
 		os.Exit(2)
@@ -108,6 +112,7 @@ func printUsage(w *os.File) {
 	fmt.Fprintf(w, `sandbox-ctl — sandbox runtime control
 
 Usage:
+  sandbox-ctl --version
   sandbox-ctl shutdown --sandbox-id <sid> --run-id <run-id>
                         [--path-id <leaf>] [--run-root <dir>] [--timeout <duration>]
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
