@@ -288,6 +288,7 @@ Changing the output directory does not move existing published parents. A receiv
 | `launch.pid_namespace` | `private`, `shared`; `private` | Private makes the application namespace PID 1; shared exposes a Runtime PID 1 that reaps orphaned processes |
 | `launch.user` | Identity string; image user, otherwise root | `uid:gid` or `name:group` |
 | `launch.stop_signal` | Signal name/number; image value, otherwise `SIGTERM` | Shutdown signal |
+| `launch.restore_signal`, `launch.plugin[].restore_signal` | Optional signal name or decimal string; no default | Independently notify the live main/plugin process on memory restore; `""` clears inheritance. Linux 1–64; [Guest contract](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi.md#restore-notifications) |
 | `launch.stop_grace_period` | Duration; `10s` | Grace before SIGKILL, represented as whole seconds to the Guest |
 | `launch.start_timeout` | Duration; empty/zero means no forced limit | Host wait for `launch_ack`, including ordered init work |
 | `launch.plugin[].exec`, `.args`, `.env`, `.workdir`, `.user` | String/list/map/string/string | Companion process declaration in the same workload root/cgroup; process ABI is in [Guest ABI](guest-abi.md#launch-spec) |
@@ -298,6 +299,18 @@ Changing the output directory does not move existing published parents. A receiv
 | `init[].exec`, `.args`, `.env`, `.workdir`, `.user` | String/list/map/string/string | Ordered one-shot commands before application startup |
 | `init[].timeout` | Duration; empty/zero means no timeout | Nonzero exit or timeout aborts initialization |
 | `metadata` | String map; empty | Opaque portable values; runtime does not interpret them |
+
+### Restore signal policy
+
+Use `restore_signal: SIGUSR1`, `restore_signal: USR1` or `restore_signal: "10"`.
+Ordinary cold omission means no notification. Cold derivation from E inherits an
+omitted field; explicit `restore_signal: ""` clears it. Main and plugin fields are
+independent, and the plugin list keeps whole-list replacement. The policy is
+portable and retained on export/capture. Memory restore uses the captured policy
+and rejects launch overrides. This field never inherits the OCI StopSignal or
+the shutdown default. Signals do not wait for business initialization; systemd
+users can register synchronous services on `sandbox-restore.target` using the
+[Guest contract](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi.md#restore-notifications).
 
 ### Systemd launch policy
 

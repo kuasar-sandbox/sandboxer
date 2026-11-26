@@ -311,6 +311,11 @@ func MergeLaunch(image *ImageConfig, override config.LaunchConfig) (*proto.Launc
 		spec.StopSignal = n
 	}
 
+	n, err := config.ParseRestoreSignal(override.RestoreSignal)
+	if err != nil {
+		return nil, fmt.Errorf("merge launch: restore_signal: %w", err)
+	}
+	spec.RestoreSignal = n
 	return spec, nil
 }
 
@@ -383,22 +388,27 @@ func toProtoInit(init []config.InitConfig) []proto.InitSpec {
 }
 
 // toProtoPlugins converts config plugin slices to proto slices.
-func toProtoPlugins(plugins []config.PluginConfig) []proto.PluginSpec {
+func toProtoPlugins(plugins []config.PluginConfig) ([]proto.PluginSpec, error) {
 	if len(plugins) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]proto.PluginSpec, len(plugins))
 	for i, p := range plugins {
+		sig, err := config.ParseRestoreSignal(p.RestoreSignal)
+		if err != nil {
+			return nil, fmt.Errorf("launch.plugin[%d].restore_signal: %w", i, err)
+		}
 		out[i] = proto.PluginSpec{
-			Exec:    p.Exec,
-			Args:    p.Args,
-			Env:     p.Env,
-			Workdir: p.Workdir,
-			User:    p.User,
-			Restart: p.Restart,
+			Exec:          p.Exec,
+			Args:          p.Args,
+			Env:           p.Env,
+			Workdir:       p.Workdir,
+			User:          p.User,
+			Restart:       p.Restart,
+			RestoreSignal: sig,
 		}
 	}
-	return out
+	return out, nil
 }
 
 // durationMs parses a Go duration (already config-validated) to milliseconds;

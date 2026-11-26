@@ -1115,7 +1115,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	ls.Files = cfg.ProtoFiles()
 	ls.Init = toProtoInit(cfg.Init)
-	ls.Plugins = toProtoPlugins(cfg.Launch.Plugin)
+	ls.Plugins, err = toProtoPlugins(cfg.Launch.Plugin)
+	if err != nil {
+		return fail(err)
+	}
 	ls.SharePID = cfg.Launch.PIDNamespace == "shared"
 	ls.StopGraceSec = cfg.StopGraceSeconds()
 	ls.Stdio = spec.Stdio.ProtoSpec()
