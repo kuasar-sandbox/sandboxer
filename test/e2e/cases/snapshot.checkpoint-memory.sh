@@ -7,6 +7,7 @@ set -euo pipefail
 umask 077
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
 source "$E2E_LIB/sandboxer/tarstream.sh"
+source "$E2E_LIB/sandboxer/case_timing.sh"
 : "${WORK:?WORK is required}"
 : "${OUT:?OUT is required}"
 : "${E2E_IMAGE:?E2E_IMAGE is required}"
@@ -15,16 +16,25 @@ require_kvm
 unset MANIFEST_KEY MANIFEST_CONFIG
 for command in docker mount umount mountpoint python3 timeout truncate mkfs.ext4; do require_command "$command"; done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do require_binary "$binary"; done
+pairs_cleanup() {
+    local status=$?
+    set +e
+    case_phase_end "$status" || { [ "$status" -ne 0 ] || status=1; }
+    exit "$status"
+}
 # Each pair runs in an isolated filesystem and sandbox instance. Flatten the
 # immutable guest root once; every case references it outside the ENOSPC mount.
 if [ -z "${CHECKPOINT_MEMORY_FIRST_FORMAT:-}" ]; then
     mkdir -p "$WORK/fixture" "$OUT"
+    trap pairs_cleanup EXIT
+    case_phase_begin shared-root-preparation
     docker image inspect "$E2E_IMAGE" >/dev/null
     docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/fixture/root.img" --no-progress
     FIXTURE_DIRECTORY="$WORK/fixture"
     for pair in local:local local:bundle bundle:local bundle:bundle; do
         first=${pair%%:*}
         second=${pair##*:}
+        case_phase_begin "format-$first-to-$second"
         WORK="$WORK/$first-$second" OUT="$OUT/$first-$second" \
             CHECKPOINT_MEMORY_FIXTURE_DIRECTORY="$FIXTURE_DIRECTORY" \
             CHECKPOINT_MEMORY_FIRST_FORMAT="$first" CHECKPOINT_MEMORY_SECOND_FORMAT="$second" \
@@ -48,6 +58,7 @@ REQUEST_PIDS=()
 cleanup() {
     local status=$?
     set +e
+    case_phase_end "$status" || { [ "$status" -ne 0 ] || status=1; }
     if [ "$status" -ne 0 ]; then
         printf 'checkpoint-memory failed (%s -> %s), exit=%s\n' "$FIRST_FORMAT" "$SECOND_FORMAT" "$status" >&2
         df -PB1 "$CP_DIR" "$WORK" >&2
@@ -83,6 +94,7 @@ PY
     exit "$status"
 }
 trap cleanup EXIT
+case_phase_begin pair-preparation
 # Limit only publication storage. Restoring an older disk version must be
 # able to materialize its ordinary lower artifacts beside this mount.
 mkdir -p "$CP_DIR"
@@ -330,6 +342,7 @@ resource.prlimit(h['pid'],resource.RLIMIT_FSIZE,tuple(p['previous']))
 PY_PAYLOAD_RELEASE
 }
 
+case_phase_begin capture-retirement-and-enospc
 start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
 FIRST_RUN=$RUN_PID
 capture first "$FIRST_FORMAT"
@@ -340,6 +353,7 @@ S_FIRST="$(snapshot_path first)"
 check_pending_memory initial
 hold_payload_failure first "$OUT/cold.log"
 
+case_phase_begin restore-publish-and-second-capture
 start resumed "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
 SECOND_RUN=$RUN_PID
 check_memory resumed
@@ -380,6 +394,7 @@ assert_contains "$OUT/referenced-delete.stderr" "durable source"
 
 # Restore an older branch while both obligations exist. The current locator
 # names second, but the selected source is first; neither selects the RAM ledger.
+case_phase_begin branch-and-independent-delete
 start branched "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_FIRST" --enable-checkpoint
 THIRD_RUN=$RUN_PID
 check_memory branched
@@ -413,6 +428,7 @@ check_memory branched
 # The two pending holders and independent cancellation were observed above.
 # Release the fault before capturing the materialized branch: preserving its
 # disk lower artifacts is unrelated to the frozen-memory obligation test.
+case_phase_begin release-and-materialize
 mount -o remount,size=512m "$CP_DIR"
 release_payload_failure first
 wait "$FIRST_RUN"
@@ -438,10 +454,12 @@ for checkpoint,mode in zip(('first','third'),sys.argv[2:4]):
     if mode=='bundle':assert '@manifest:' in ref and zipfile.is_zipfile(root/name),ref
     else:assert '@digest:' in ref and tarfile.is_tarfile(root/name),ref
 PY
+case_phase_begin materialized-restore
 start next-resume "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_THIRD" --enable-checkpoint
 check_memory next-resume
 kill -TERM "$RUN_PID"
 wait "$RUN_PID" || true
+case_phase_begin portable-restore-without-local-captures
 PORTABLE_REF="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshotRef"])' "$OUT/published.json")"
 # Removing the dedicated publication mount makes every local capture
 # unavailable, so the published snapshot must restore independently.
