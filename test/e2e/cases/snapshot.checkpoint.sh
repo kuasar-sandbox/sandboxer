@@ -6,6 +6,7 @@ set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
 source "$E2E_LIB/sandboxer/tarstream.sh"
+source "$E2E_LIB/sandboxer/case_timing.sh"
 : "${E2E_WORKSPACE:?E2E_WORKSPACE is required}"
 : "${WORK:?WORK is required}"
 : "${OUT:?OUT is required}"
@@ -32,6 +33,7 @@ PUBLISH_PIDS=()
 cleanup() {
     local status=$?
     set +e
+    case_phase_end "$status" || { [ "$status" -ne 0 ] || status=1; }
     for pid in "${PUBLISH_PIDS[@]}"; do
         kill -TERM "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
@@ -46,6 +48,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+case_phase_begin preparation
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/root.img" --no-progress
 ROOT_REF="$(plaintext_tarstream_ref "$WORK/root.img")"
 for disk in root scratch dataset; do
@@ -263,6 +266,7 @@ PY
 
 # Establish a portable nonzero lower first. A later Guest trim must mask that
 # lower through both local Checkpoint and portable export/restore paths.
+case_phase_begin nonzero-lower-seed
 start trim-seed "seed-$PATH_ID" --config "$WORK/cold.yaml"
 guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload; do dd if=/dev/urandom of="$f" bs=1048576 count=16 2>/dev/null; done; sync'
 guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" seed >"$OUT/trim-seed.json"
@@ -281,6 +285,7 @@ PY
 for mode in v3 v4; do
     for policy in plain xts; do
         TRIM_LABEL="trim-$mode-$policy"
+        case_phase_begin "$TRIM_LABEL"
         TRIM_PATH="$TRIM_LABEL-$BASHPID"
         TRIM_ARGS=()
         [ "$mode" != v4 ] || TRIM_ARGS+=(--enable-checkpoint)
@@ -306,6 +311,7 @@ for mode in v3 v4; do
         stop_run
     done
 done
+case_phase_begin versions-and-concurrent-publication
 start cold "$PATH_ID" --config "$WORK/restore.yaml" --from "$WORK/trim-lower/$SID.sandbox" --enable-checkpoint
 guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" trim >"$OUT/trim-completed.json"
 # Keep the historical-GC fixture in the active DIFF as well as in its lower.
@@ -434,6 +440,7 @@ sha256sum -c "$OUT/source-artifacts.hashes"
 stop_run
 
 # The active epoch changed, so a historical restore must allocate new identities.
+case_phase_begin historical-and-cross-directory-restore
 start historical "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_B" --enable-checkpoint
 check_hashes historical
 assert_no_restore_pins "$CP_DIR"
@@ -492,6 +499,7 @@ stop_run
 
 # Published roots contain portable data. Hide the original version directory and
 # immutable root source before restoring both the published E and S artifacts.
+case_phase_begin portable-restore-without-sources
 mv "$BASE_ROOT/$PATH_ID" "$BASE_ROOT/source-hidden"
 mv "$WORK/root.img" "$WORK/root.img.hidden"
 for kind in a b; do
@@ -546,6 +554,7 @@ mv "$WORK/root.img.hidden" "$WORK/root.img"
 # writers are now historical files; online management must share their bounded
 # metadata handles with independent maintenance, and obsolete payload must be
 # reclaimed without another delete or foreground write.
+case_phase_begin historical-gc
 CP_DIR="$BASE_ROOT/$PATH_ID/checkpoint"
 python3 - "$CP_DIR" "$OUT/history-before-gc.json" <<'PY'
 import json, pathlib, sys
@@ -590,6 +599,7 @@ PY
 # Repeat with local XTS enabled; the runtime still owns the live disks after its
 # temporary restore readers disappear. Publication must produce a portable root.
 for policy in plain xts; do
+    case_phase_begin "pin-handoff-$policy"
     PIN_PATH="pins-$policy"
     CP_DIR="$BASE_ROOT/$PIN_PATH/checkpoint"
     CRYPTO_ARGS=()
