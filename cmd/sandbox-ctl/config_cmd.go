@@ -245,14 +245,17 @@ boot:
     base: file:///opt/sandbox/app.erofs    # flattened image (erofs, ro lower)
     overlay:
       # diff omitted → auto-default to /var/lib/sandbox/<sid>/<sid>.overlay.diff
-      diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4
+      # Built-in empty ext4 upper; no host formatting step (no journal).
+      # Select an external template instead when other filesystem features are needed.
+      diff_template: mkfs://ext4?size=1GiB
     # Single-disk mode: omit the overlay block above and give the root disk
     # write capability directly (writable ext4, no overlayfs, no second disk):
     #   diff_template: file:///opt/sandbox/root-templates/app-2G.ext4
     # (base optional; launch.exec required — single-disk has no image config.)
 launch:
-  exec: /usr/bin/app                       # or omit to use the image's Entrypoint/Cmd (overlay mode only)
-  args: []
+  # Overlay mode inherits the image's Entrypoint/Cmd. Uncomment to override:
+  # exec: /usr/bin/app
+  # args: []
   env:                                     # portable: re-applied by run --from
     APP_MODE: production
   # ephemeral_env:                        # instance-only: omitted from Sandbox E

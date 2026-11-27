@@ -3,8 +3,8 @@
 # Sandbox configuration reference
 
 This is the reference for host `sandbox.yaml`, ordered overlays, effective
-defaults and output targets. Begin with the ownership example, then render the
-effective configuration before running it. Configuration selects policies;
+defaults and output targets. Start with a cold workload configuration or a Host-only
+restore projection, then render the effective configuration before running it. Configuration selects policies;
 [Runtime](runtime.md) defines the operation that consumes them,
 [resources](resources.md) defines Budget and accounting, and
 [block storage](block-storage.md) defines the resulting storage lifetime.
@@ -13,6 +13,53 @@ Portable E/S schemas belong to [artifacts](artifacts.md#portable-config).
 Guest messages and process semantics belong to [Guest ABI](guest-abi.md).
 Manifest/store/crypto/cache configuration remains in accelerator; sharing a YAML
 input does not make it part of the sandbox schema.
+
+## Prepare a workload configuration
+
+For a new application, select the published kernel and runtime, a flattened image,
+and a writable filesystem source. A fresh ext4 upper or data disk can use the
+built-in initializer. This complete cold configuration uses the image's
+Entrypoint/Cmd and adds an independent workspace disk:
+
+```yaml
+resources:
+  capacity: {cpu: 2, memory: 2GiB}
+  allocatable: {cpu: 2, memory: 2GiB}
+boot:
+  kernel: file:///absolute/release/bin/vmlinux
+  runtime: file:///absolute/release/bin/sandbox-runtime.bundle
+  root:
+    base: file:///absolute/images/app.img
+    overlay:
+      diff_template: mkfs://ext4?size=1GiB
+  disks:
+    - name: work
+      diff_template: mkfs://ext4?size=8GiB
+mounts:
+  - {target: /workspace, type: disk, source: work}
+```
+
+Replace the absolute paths, choose capacities for the workload and validate with
+`sandbox-ctl config --config sandbox.yaml --check strict`. The initializer uses
+the documented no-journal ext4 profile; use an external template when other
+features are required. Its capacity is a device size, not a host-space reservation
+or a filesystem resize command. See [filesystem sources](#disk-capacity).
+
+The workspace is a separate disk in the captured graph. Its name, array position
+and mount topology must remain stable when deriving from E or restoring S.
+An ordinary automatically created writer is removed on runtime exit: capture its
+state or choose the explicit/checkpoint ownership workflow before relying on
+retention. A reserved `slot` only declares a future device; even a slot with a size
+is unbound until `disk bind` receives a complete disk definition. Use
+[late binding](#late-binding-and-directory-projections) when the data arrives after
+launch, rather than preparing placeholder files or trying to change disk topology
+on restore.
+
+For memory restore, derive the Host-only file with
+`sandbox-ctl config --config sandbox.yaml --mode restore -o restore-host.yaml`.
+Then review current Host paths and network identity. Do not copy cold-only
+`launch`, `files`, `mounts` or `init` into that file; those are captured state.
+The [standalone workflow](runtime.md#standalone-workflow) shows the full sequence.
 
 <a id="sandbox-yaml"></a>
 
@@ -223,6 +270,8 @@ directory and survive normal exit, including automatically selected paths. Follo
 [checkpoint ownership and cleanup](block-storage.md#checkpoints) for that mode.
 Capacity comes from the selected disk source, not a quota or resize flag.
 See [capacity and migration](#disk-capacity).
+
+<a id="late-binding"></a>
 
 ### Late binding and directory projections
 

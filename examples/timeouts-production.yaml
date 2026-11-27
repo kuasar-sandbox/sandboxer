@@ -52,5 +52,5 @@ timeouts:
   app_notify: 200ms
 
   # Opt-in SDK post-ACK overall deadline (default/0 = none); independent of
-  # app_notify. Default 2s; explicit values must be positive.
+  # app_notify. The 2s below is an example, not a default; positive values opt in.
   app_start: 2s

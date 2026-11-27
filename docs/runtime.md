@@ -8,9 +8,11 @@ prepare inputs, create a base runtime, launch a workload, execute or capture it,
 and close it. It owns operation/state preconditions and coordination across the
 guest, VMM, memory, disks and resource controller.
 
-For a first standalone run, build the binaries as described in the
-[README](../README.md#build-and-test), prepare the kernel, runtime Bundle and a
-flattened workload image, and render a [configuration](configuration.md#render-config).
+For a first standalone run, use the matching published sandboxer, Runtime and
+Kernel from a selected aggregate release. Prepare a flattened workload image with
+[guest-runtime](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime.md),
+then render a [configuration](configuration.md#render-config). A source build is
+an alternative documented in the [README](../README.md#build-and-test).
 Use the [run examples](#run) to choose explicit cold start, cold start from E, or
 restore from S. Follow [capture](#snapshot) with a new SandboxID to reuse a
 snapshot as an independent instance. There is no separate live-fork CLI or SDK;
@@ -35,25 +37,50 @@ guarantee. See [artifact compatibility](artifacts.md#compatibility).
 
 ## Complete standalone workflow
 
-Prepare an absolute local kernel path, a matching runtime Bundle, and a flattened
-EROFS workload image with a mountable ext4 upper source. A preformatted template,
-existing diff or immutable upper is required; `run` does not format a blank file.
-The following sequence assumes those inputs are bound in `sandbox.yaml` and the
-chosen workload remains alive. Local operations need the Linux/KVM privileges
-listed in the [build and runtime prerequisites](../README.md#build-and-test).
+This workflow owns one VM directly. For persistent node services, application
+templates and cluster placement, use the
+[platform quickstart](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md).
 
-1. Create and edit the complete commented template, then validate it:
+Prepare absolute paths to the selected local kernel, runtime Bundle and flattened
+EROFS workload image. For a new writable upper, use the built-in
+`mkfs://ext4?size=1GiB` initializer; no host `truncate` or `mkfs.ext4` step is needed.
+The [filesystem-source contract](configuration.md#disk-capacity) covers sizes,
+the no-journal profile and externally prepared templates for other filesystem
+features. An arbitrary blank raw file is still not a valid filesystem source.
+The chosen workload must remain alive for exec and capture. Local operations need
+the Linux/KVM privileges listed in the
+[build and runtime prerequisites](../README.md#build-and-test).
+
+1. Create the commented template and replace its example paths and workload:
 
    ```bash
    sandbox-ctl config --template -o sandbox.yaml
-   # Set the kernel, runtime, image, ext4 source and workload for this host.
+   ```
+
+   For a fresh overlay root, set `boot.root` as below, leaving the kernel and
+   runtime paths in `boot.kernel` and `boot.runtime`. Omit an overlay `base` and
+   an explicit `diff` for this fresh instance:
+
+   ```yaml
+   boot:
+     root:
+       base: file:///absolute/path/to/app.img
+       overlay:
+         diff_template: mkfs://ext4?size=1GiB
+   ```
+
+   This is a fragment to merge into the template, not a second `boot` mapping.
+   Configure network fields only when the host supplies a TAP or connector
+   binding. Then validate the complete file:
+
+   ```bash
    sandbox-ctl config --config sandbox.yaml --check strict
    ```
 
 2. Start the runtime in one terminal:
 
    ```bash
-   sandbox-ctl run --config sandbox.yaml --sandbox-id demo-1
+   sandbox-ctl run --config sandbox.yaml --sandbox-id demo-1 --tty=false
    ```
 
 3. In another terminal, use a command that exists in the workload, then capture
@@ -61,7 +88,7 @@ listed in the [build and runtime prerequisites](../README.md#build-and-test).
 
    ```bash
    sandbox-ctl exec --sandbox-id demo-1 -- /bin/sh -c 'printf "guest ready\n"'
-   sandbox-ctl snapshot --path-id demo-1 --output ./artifacts --resume
+   sandbox-ctl snapshot --path-id demo-1 --output ./artifacts --resume --json
    ```
 
 4. Project host-only restore configuration and create an independent instance:
@@ -70,16 +97,41 @@ listed in the [build and runtime prerequisites](../README.md#build-and-test).
    sandbox-ctl config --config sandbox.yaml --mode restore -o restore-host.yaml
    sandbox-ctl config --config restore-host.yaml --mode restore --check strict
    sandbox-ctl run --restore ./artifacts/demo-1.snapshot \
-     --config restore-host.yaml --sandbox-id demo-2
+     --config restore-host.yaml --sandbox-id demo-2 --tty=false
    ```
 
-The snapshot command reports its committed root; use that returned reference if
-output mode or location differs from this local example. Review current-instance
-network identity and writable paths before reusing host configuration for another
-SandboxID. Closing either runtime releases that runtime's ownership; destroying
-a runtime does not authorize deleting shared immutable artifact dependencies.
-Use [live export](#export) when the desired result is a cold-start E without
-memory state, or [offline assembly](artifacts.md#assemble) to build E without a VM.
+The snapshot command reports the committed `snapshotRef` and its `sandboxRef`.
+Use the returned reference if output mode or location differs from this local
+alias example. Keep its dependency graph available, not just the alias. Review
+current-instance network identity and writable paths before reusing host
+configuration for another SandboxID. The restored instance resumes the captured
+processes; it does not rerun Init or accept a replacement launch command.
+
+To finish the example, stop each foreground `run` through its owning terminal
+with Ctrl+C and wait for it to exit. Automatic ordinary diffs are removed on exit;
+explicit writable paths and checkpoint storage have their separate retention
+rules. Destroying a runtime does not authorize deleting shared artifacts.
+
+### Choose the state to retain
+
+| Goal | Recommended operation | What to verify |
+| --- | --- | --- |
+| Reuse application files and configuration with a fresh process | [Live `export`](#export), then `run --from` its E; use [offline assembly](artifacts.md#assemble) if the image is already prepared | Init and application startup run again; memory and external sessions are not retained. |
+| Resume the captured application in another instance | `snapshot --resume`, then `run --restore` its S with a new SandboxID | The source continues; the destination needs the captured runtime identity, compatible VMM/device inputs and its own host/network bindings. |
+| Keep frequent captures on the same node | Launch with `--enable-checkpoint`, then explicitly capture with `--checkpoint ID` | [Checkpoint storage](block-storage.md#checkpoints) retains local disk versions; enabling the backend alone does not change ordinary copy capture. |
+| Move a retained capture to another node or shared storage | [Publish](artifacts.md#publish) the complete S/E graph and use the returned references | A local checkpoint or holder is not a portable backup; publication materializes its selected local versions. Retained published parents still need access and keys. |
+
+Capture already freezes managed processes, drains block I/O and syncs managed
+ext4 filesystems. Do not add an unconditional Guest-wide `sync` or cache-drop loop
+to every capture. Applications that coordinate external state must still prepare
+that state, and restore handlers must be installed before capture; see
+[Guest startup and restore](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime.md#application-restore).
+`--drop-caches` is optional, not a filesystem consistency requirement.
+
+A failed `--resume` capture is not a guarantee that the source remains usable.
+If reattachment cannot establish ACK/MUX after the bounded retry, the owner
+terminates the runtime. Inspect the operation result and owner logs before
+retrying; the [failure contract](#capture-barrier) describes the remaining limits.
 
 <a id="runtime-states"></a>
 

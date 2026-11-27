@@ -1061,15 +1061,13 @@ E2B memory=true
 
 S/E 后缀几何、确定性 ZIP 编码及 sparse prefix/append 视图由 `accelerator/pkg/tailzip` 实现。Sandboxer 提供有序角色条目与大小上限；Sandbox/Snapshot 模块保留 portable config、JSON/state 和设备拓扑校验。逻辑引用位置共用 `manifest.RefLocations`。
 
-<a id="related"></a>
+<a id="physical-retirement"></a>
 
-## 相关文档
+## 已冻结 Runtime 的延后物理退役
 
-[Runtime：启动、控制、捕获与恢复](runtime_zh.md) | [Sandbox 配置参考](configuration_zh.md) | [Guest 内存与按需恢复](memory_zh.md) | [块存储：设备、可写状态与 Checkpoint](block-storage_zh.md) | [资源控制与 Usage 计量](resources_zh.md) | [Guest ABI：启动、应用与 Host 协议](guest-abi_zh.md) | [VMM 集成与 Cloud Hypervisor 补丁](vmm_zh.md)
-
-[组件入口](../README_zh.md) · [构建与补丁材料](../native-deps/README_zh.md)
-
-### 已冻结 Runtime 的延后物理退役（#476）
+托管 checkpoint 暂停中，Runtime 退役完成与物理 RAM 释放是两个事件。保留的 holder 持有待完成的
+保存及释放工作；完成前由节点 owner 管理其进程和文件。在其他节点依赖这次捕获前先发布所选结果。
+本地与可移植完成边界见 [checkpoint 流程](block-storage_zh.md#checkpoints)。
 
 对支持延后 VMM 退出的托管捕获，Checkpoint 不可逆提交后，原 Runtime 同步结束执行，
 停止后端、释放磁盘所有权及 RunDir，并完成终态 usage 和既有 retained 额度交接。
@@ -1085,3 +1083,11 @@ dev/inode；正常及异常路径均要求真正的线程组退出及既有 RAM 
 未采集的 CH CPU 尾段标记未知。S/E、Bundle 与 tarstream 格式不变。
 旧管理端未授权时使用原记录版本与同步 CH 退出；旧读取者对本地 v3 记录 fail closed，
 节点降级前需处理这些本地捕获（不可让旧版本管理仍含 v3 记录的目录）。
+
+<a id="related"></a>
+
+## 相关文档
+
+[Runtime：启动、控制、捕获与恢复](runtime_zh.md) | [Sandbox 配置参考](configuration_zh.md) | [Guest 内存与按需恢复](memory_zh.md) | [块存储：设备、可写状态与 Checkpoint](block-storage_zh.md) | [资源控制与 Usage 计量](resources_zh.md) | [Guest ABI：启动、应用与 Host 协议](guest-abi_zh.md) | [VMM 集成与 Cloud Hypervisor 补丁](vmm_zh.md)
+
+[组件入口](../README_zh.md) · [构建与补丁材料](../native-deps/README_zh.md)

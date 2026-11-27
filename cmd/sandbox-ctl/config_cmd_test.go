@@ -3,11 +3,47 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
+
+func TestConfigTemplateUsesGeneratedUpperAndImageCommand(t *testing.T) {
+	t.Setenv("SANDBOX_CONFIG", "")
+	rc, stdout, stderr := captureInfoOutput(t, func() int {
+		return configCmd([]string{"--template", "--check", "strict"})
+	})
+	if rc != 0 || stderr != "" {
+		t.Fatalf("config template rc=%d stderr=%q", rc, stderr)
+	}
+	cfg, _, err := config.LoadConfigBytesWithPresence([]byte(stdout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Boot.Root.Overlay == nil {
+		t.Fatal("cold template must select an overlay root")
+	}
+	upper, err := config.ParseDiffTemplate(cfg.Boot.Root.Overlay.DiffTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upper.Kind != config.DiffTemplateMkfs || upper.Size != 1<<30 {
+		t.Fatalf("cold template requires an external upper or has the wrong capacity: %+v", upper)
+	}
+	launch, err := sandbox.MergeLaunch(&sandbox.ImageConfig{
+		Entrypoint: []string{"/usr/local/bin/image-app", "--foreground"},
+		Cmd:        []string{"serve"},
+	}, cfg.Launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if launch.Exec != "/usr/local/bin/image-app" || !slices.Equal(launch.Args, []string{"--foreground", "serve"}) {
+		t.Fatalf("cold template overrides the image command: exec=%q args=%q", launch.Exec, launch.Args)
+	}
+}
 
 func TestConfigDefaultPreservesColdOverlayBase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sandbox.yaml")

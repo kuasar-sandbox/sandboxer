@@ -1174,15 +1174,16 @@ E2B memory=true
 
 S/E suffix geometry, deterministic ZIP encoding and sparse prefix/append views are implemented by `accelerator/pkg/tailzip`. Sandboxer supplies ordered role entries and size limits; the Sandbox/Snapshot modules retain their portable config, JSON/state and device-topology validation. Logical reference locations use `manifest.RefLocations`.
 
-<a id="related"></a>
+<a id="physical-retirement"></a>
 
-## Related documentation
+## Deferred physical retirement of a frozen runtime
 
-[Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Guest memory and lazy restore](memory.md) | [Block storage: devices, writable state and checkpoints](block-storage.md) | [Resource control and usage accounting](resources.md) | [Guest ABI: boot, applications and host protocols](guest-abi.md) | [VMM integration and Cloud Hypervisor patches](vmm.md)
-
-[Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)
-
-### Deferred physical retirement of a frozen runtime (#476)
+For managed checkpoint pauses, completion of runtime retirement and release of
+its physical RAM are separate events. The retained holder owns pending save and
+release work; keep its files and process under the node owner until that work
+finishes. Publish the selected capture before relying on it on another node.
+The [checkpoint workflow](block-storage.md#checkpoints) defines the local and
+portable completion boundaries.
 
 For negotiated managed captures, an irreversible checkpoint commit fences the
 old execution, joins its backends, releases ordinary disk and RunDir ownership,
@@ -1203,3 +1204,11 @@ CPU tail is unknown. S/E, Bundle and tarstream formats are unchanged. An older
 host without the capability uses the original record version and synchronous
 CH exit. Older readers fail closed on local v3 records; handle these local
 captures before downgrading a node to a reader that does not support v3.
+
+<a id="related"></a>
+
+## Related documentation
+
+[Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Guest memory and lazy restore](memory.md) | [Block storage: devices, writable state and checkpoints](block-storage.md) | [Resource control and usage accounting](resources.md) | [Guest ABI: boot, applications and host protocols](guest-abi.md) | [VMM integration and Cloud Hypervisor patches](vmm.md)
+
+[Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)

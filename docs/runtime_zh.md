@@ -6,8 +6,10 @@
 本页按 Runtime 对象的一生组织：准备输入、创建基础 runtime、启动工作负载、执行或捕获、关闭。
 操作与状态前提，以及 Guest、VMM、内存、磁盘和资源控制器之间的协调，均由本页定义。
 
-首次独立使用时，先按 [README](../README_zh.md#构建与测试) 构建二进制，准备内核、runtime Bundle
-和 flatten 后的工作负载镜像，再生成[配置](configuration_zh.md#render-config)。
+首次独立使用时，采用选定聚合发行版中匹配的 sandboxer、Runtime 和 Kernel，按
+[guest-runtime 指南](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime_zh.md)
+准备 flatten 后的工作负载镜像，再生成[配置](configuration_zh.md#render-config)。
+也可按 [README](../README_zh.md#构建与测试) 从源码构建。
 按[运行示例](#run)选择显式冷启动、从 E 冷启动或从 S 恢复。捕获后使用新的 SandboxID
 可以创建独立实例；当前没有单独的运行中 fork CLI 或 SDK，这一流程由
 `snapshot --resume` 与 `run --restore` 表达。
@@ -29,30 +31,51 @@
 
 ## 完整独立使用流程
 
-先准备本地绝对 kernel 路径、匹配 runtime Bundle、flatten 后的 EROFS 工作负载镜像和可挂载的 ext4 upper
-源。必须有已格式化 template、已有 diff 或 immutable upper；`run` 不负责把空白文件格式化。
-以下流程假定这些输入已绑定到 `sandbox.yaml`，且所选工作负载持续运行。本地操作要求
+本流程直接持有一个 VM。持久节点服务、应用模板及集群调度见
+[平台快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)。
+
+先准备选定本地 Kernel、Runtime Bundle 和 flatten 后 EROFS 工作负载镜像的绝对路径。
+新建可写 upper 时使用内建的 `mkfs://ext4?size=1GiB` 初始化源，无需先在 Host 执行
+`truncate` 或 `mkfs.ext4`。[文件系统源契约](configuration_zh.md#disk-capacity)说明容量、无 journal
+格式，以及需要其他文件系统特性时如何使用外部模板。任意空白 raw 文件仍不是有效的文件系统源。
+执行 exec 和捕获时，所选工作负载必须持续运行。本地操作要求
 [构建与运行前提](../README_zh.md#构建与测试)列出的 Linux/KVM 权限。
 
-1. 生成并编辑完整注释模板，然后校验：
+1. 生成完整注释模板，替换示例路径和工作负载：
 
    ```bash
    sandbox-ctl config --template -o sandbox.yaml
-   # 设置本机 kernel、runtime、image、ext4 source 和工作负载。
+   ```
+
+   新建 overlay 根盘时，将 `boot.root` 设为下列内容，Kernel 和 Runtime 路径仍分别填写在
+   `boot.kernel`、`boot.runtime`。这个新实例不设置 overlay `base` 或显式 `diff`：
+
+   ```yaml
+   boot:
+     root:
+       base: file:///absolute/path/to/app.img
+       overlay:
+         diff_template: mkfs://ext4?size=1GiB
+   ```
+
+   这是合入模板的配置片段，不是在同一文件中再添加一份 `boot`。
+   仅当 Host 提供 TAP 或 connector 绑定时配置网络字段。随后校验完整文件：
+
+   ```bash
    sandbox-ctl config --config sandbox.yaml --check strict
    ```
 
 2. 在一个终端启动 runtime：
 
    ```bash
-   sandbox-ctl run --config sandbox.yaml --sandbox-id demo-1
+   sandbox-ctl run --config sandbox.yaml --sandbox-id demo-1 --tty=false
    ```
 
 3. 在另一个终端执行工作负载中确实存在的命令，然后捕获可复用 snapshot，并继续原实例：
 
    ```bash
    sandbox-ctl exec --sandbox-id demo-1 -- /bin/sh -c 'printf "guest ready\n"'
-   sandbox-ctl snapshot --path-id demo-1 --output ./artifacts --resume
+   sandbox-ctl snapshot --path-id demo-1 --output ./artifacts --resume --json
    ```
 
 4. 投影仅含 Host 字段的恢复配置，创建独立实例：
@@ -61,13 +84,32 @@
    sandbox-ctl config --config sandbox.yaml --mode restore -o restore-host.yaml
    sandbox-ctl config --config restore-host.yaml --mode restore --check strict
    sandbox-ctl run --restore ./artifacts/demo-1.snapshot \
-     --config restore-host.yaml --sandbox-id demo-2
+     --config restore-host.yaml --sandbox-id demo-2 --tty=false
    ```
 
-Snapshot 命令会报告已提交根引用；若输出模式或位置不同于这个 local 示例，应使用实际返回 ref。
-将 Host 配置用于另一个 SandboxID 前，要检查当前实例网络身份和可写路径。关闭某个 runtime 只释放它的
-所有权；销毁 runtime 不授权删除共享不可变依赖。只需要冷启动 E 而无需内存状态时，使用[在线 export](#export)；
-希望完全不启动 VM 时，使用[离线组装](artifacts_zh.md#assemble)。
+Snapshot 命令报告已提交的 `snapshotRef` 及其 `sandboxRef`；若输出模式或位置不同于这个本地别名
+示例，应使用实际返回引用。保留其完整依赖图，不能只保留别名。将 Host 配置用于另一个 SandboxID 前，
+检查当前实例网络身份和可写路径。恢复实例继续捕获的进程，不重跑 Init，也不接受新的启动命令。
+
+结束示例时，在各自持有前台 `run` 的终端按 Ctrl+C，并等待进程退出。普通自动 diff 随退出删除；
+显式可写路径和 checkpoint 存储遵循各自保留规则。销毁 Runtime 不授权删除共享制品。
+
+### 选择要保留的状态
+
+| 目标 | 推荐操作 | 核对事项 |
+| --- | --- | --- |
+| 复用应用文件及配置，以新进程启动 | [在线 `export`](#export) 后用 E 执行 `run --from`；已有镜像时可[离线组装](artifacts_zh.md#assemble) | Init 和应用启动重新执行；内存及外部会话不保留。 |
+| 在另一个实例继续捕获的应用 | `snapshot --resume` 后以新 SandboxID 对 S 执行 `run --restore` | 源实例继续运行；目标需要捕获时的 Runtime 身份、兼容 VMM/设备输入及自己的 Host/网络绑定。 |
+| 在同一节点频繁保留捕获 | 启动时加 `--enable-checkpoint`，每次捕获显式加 `--checkpoint ID` | [Checkpoint 存储](block-storage_zh.md#checkpoints)保留本地磁盘版本；仅启用后端不会改变普通复制捕获。 |
+| 将保留的捕获移到其他节点或共享存储 | [发布](artifacts_zh.md#publish)完整 S/E 图，使用返回引用 | 本地 checkpoint 或 holder 不是可移植备份；发布会物化选中的本地版本。保留的已发布父层仍需对应访问条件及密钥。 |
+
+捕获已经冻结受管进程、排空块 I/O，并同步受管 ext4 文件系统。无需在每次捕获前无条件增加 Guest
+全局 `sync` 或清缓存循环。与外部状态协同的应用仍需准备该状态；恢复处理器必须在捕获前安装，见
+[Guest 启动与恢复](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime_zh.md#application-restore)。
+`--drop-caches` 是可选项，不是文件系统一致性的前提。
+
+`--resume` 捕获失败不保证源实例仍可用。若有界重试后重新附着仍无法建立 ACK/MUX，owner 会终止
+Runtime。重试前先检查操作结果和 owner 日志；剩余限制见[失败契约](#capture-barrier)。
 
 <a id="runtime-states"></a>
 
