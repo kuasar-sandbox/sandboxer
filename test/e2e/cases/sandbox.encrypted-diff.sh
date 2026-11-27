@@ -221,6 +221,7 @@ done
 
 kill -TERM "$RUN_PID"
 wait "$RUN_PID" || true
-PIDS=()
+# The VM has been reaped; keep the store owned until EXIT cleanup.
+PIDS=("$STORE_PID")
 
 echo "PASS sandbox.encrypted-diff.sh"
