@@ -2621,6 +2621,51 @@ class UsageReadinessWaitTests(unittest.TestCase):
 
 
 class UsageReadinessPredicateTests(unittest.TestCase):
+    def restored(self):
+        value = self.before()
+        value['live']['run_epoch'] = 'restored-epoch'
+        for gauge in value['live']['gauges']:
+            gauge['window'] = {'samples': '1'}
+        return value
+
+    def test_restored_round_waits_for_fresh_memory_and_filesystem_samples(self):
+        self.assertTrue(usage_case.restored_round_ready(self.restored(), 'epoch'))
+        self.assertFalse(usage_case.restored_round_ready({'enabled': True, 'live': None}, 'epoch'))
+        for field in ('filesystem.root', 'guest.memory'):
+            for change in ('missing', 'busy', 'old-value-only'):
+                with self.subTest(field=field, change=change):
+                    value = self.restored()
+                    if change == 'missing':
+                        value['live']['gauges'] = [g for g in value['live']['gauges'] if g['name'] != field]
+                    else:
+                        gauge = next(g for g in value['live']['gauges'] if g['name'] == field)
+                        if change == 'busy':
+                            gauge['status'] = 'busy'
+                        else:
+                            gauge['window']['samples'] = '0'
+                    self.assertFalse(usage_case.restored_round_ready(value, 'epoch'))
+        value = self.restored()
+        value['live']['counters'] = []
+        self.assertFalse(usage_case.restored_round_ready(value, 'epoch'))
+
+    def test_restored_round_does_not_accept_an_old_or_missing_epoch(self):
+        for epoch in ('epoch', ''):
+            with self.subTest(epoch=epoch):
+                value = self.restored()
+                value['live']['run_epoch'] = epoch
+                with self.assertRaises(AssertionError):
+                    usage_case.restored_round_ready(value, 'epoch')
+        value = self.restored()
+        value['enabled'] = False
+        with self.assertRaisesRegex(AssertionError, 'usage unexpectedly disabled'):
+            usage_case.restored_round_ready(value, 'epoch')
+
+    def test_restored_round_does_not_hide_a_malformed_present_metric(self):
+        value = self.restored()
+        next(g for g in value['live']['gauges'] if g['name'] == 'guest.memory')['window']['samples'] = 'malformed'
+        with self.assertRaises(ValueError):
+            usage_case.restored_round_ready(value, 'epoch')
+
     def before(self):
         live = {'sandbox_id': 'single', 'run_epoch': 'epoch',
                 'counters': [{'name': 'guest.cpu', 'source_known': True, 'status': 'ok', 'known_total_ns': '1000000000'}],
