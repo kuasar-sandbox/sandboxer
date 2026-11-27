@@ -56,7 +56,8 @@ DIFF="$WORK/cold.diff"
 truncate -s 1G "$DIFF.template"
 mkfs.ext4 -q -F -O ^has_journal "$DIFF.template"
 
-PYCODE='import time
+PYCODE='import os,time
+nonce=os.urandom(16).hex()
 print("PYBOOT-OK", flush=True)
 i=0
 while True:
@@ -64,7 +65,7 @@ while True:
         value=open("/etc/instance-id").read().strip()
     except Exception:
         value="none"
-    print("TICK", i, "ID="+value, flush=True)
+    print("TICK", i, "ID="+value, "NONCE="+nonce, flush=True)
     i+=1
     time.sleep(0.25)'
 PYCODE_JSON="$(printf '%s' "$PYCODE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
@@ -91,16 +92,25 @@ LOG1="$OUT/cold.log"
     --run-root "$WORK/runtime" --sandbox-id "$SID1" >"$LOG1" 2>&1 &
 PID1=$!
 for _ in $(seq 1 600); do
-    grep -qE '^TICK 10 ID=none$' "$LOG1" 2>/dev/null && break
+    grep -qE '^TICK 10 ID=none NONCE=[0-9a-f]{32}$' "$LOG1" 2>/dev/null && break
     kill -0 "$PID1" 2>/dev/null || e2e_fail "cold sandbox exited before expected state"
     sleep 0.05
 done
-grep -qE '^TICK 10 ID=none$' "$LOG1" || e2e_fail "cold app did not establish ID=none state"
+grep -qE '^TICK 10 ID=none NONCE=[0-9a-f]{32}$' "$LOG1" || e2e_fail "cold app did not establish ID=none state"
 
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$WORK/snapshot" --run-root "$WORK/runtime" \
     >"$OUT/snapshot.log" 2>&1
 wait "$PID1" || true
 PID1=""
+# Read the final record only after capture has stopped the source. The nonce is
+# generated inside the guest and never written to its disk, so a cold restart
+# cannot satisfy the restored process identity assertion by catching up.
+SOURCE_RECORD="$(awk '/^TICK([[:space:]]|$)/ { last=$0 } END { print last }' "$LOG1")"
+[[ "$SOURCE_RECORD" =~ ^TICK\ ([0-9]+)\ ID=none\ NONCE=([0-9a-f]{32})$ ]] || \
+    e2e_fail "missing or invalid final source process record: $SOURCE_RECORD"
+SOURCE_TICK="${BASH_REMATCH[1]}"
+SOURCE_NONCE="${BASH_REMATCH[2]}"
+WANT_TICK=$((SOURCE_TICK + 3))
 SNAPSHOT="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "snapshot is missing"
 
@@ -145,18 +155,29 @@ boot:
     overlay: { diff: file://$RESTORE_DIFF }
 EOF
 
+restored_process_progressed() {
+    awk -v minimum="$WANT_TICK" -v nonce="$SOURCE_NONCE" '
+        /^TICK([[:space:]]|$)/ {
+            if (NF != 4 || $2 !~ /^[0-9]+$/ || $3 != "ID=none" ||
+                $4 != "NONCE=" nonce) { invalid=1; exit }
+            if ($2 >= minimum) progressed=1
+        }
+        END { exit invalid || !progressed }
+    ' "$LOG2"
+}
+
 SID2="restore-config-live-$BASHPID"
 LOG2="$OUT/restore.log"
 "$BIN/sandbox-ctl" run --restore "$SNAPSHOT" --config "$WORK/restore.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID2" >"$LOG2" 2>&1 &
 PID2=$!
 for _ in $(seq 1 400); do
-    grep -qE '^TICK [0-9]+ ID=none$' "$LOG2" 2>/dev/null && break
+    restored_process_progressed 2>/dev/null && break
     kill -0 "$PID2" 2>/dev/null || e2e_fail "restored sandbox exited before original process resumed"
     sleep 0.05
 done
-grep -qE '^TICK [0-9]+ ID=none$' "$LOG2" || e2e_fail "restored process state was not preserved"
-if grep -qE '^TICK [0-9]+ ID=clone-42$' "$LOG2"; then
+restored_process_progressed || e2e_fail "restored process identity or counter was not preserved"
+if grep -qE '^TICK [0-9]+ ID=clone-42([[:space:]]|$)' "$LOG2"; then
     e2e_fail "cold-only file injection appeared in restored process"
 fi
 

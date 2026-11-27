@@ -111,6 +111,7 @@ truncate -s 1G "$DIFF.template"
 mkfs.ext4 -q -F -O ^has_journal "$DIFF.template"
 
 PYCODE='import os,time
+nonce=os.urandom(16).hex()
 print("PYBOOT-OK", flush=True)
 fd=os.open("/ticks.dat", os.O_RDWR|os.O_CREAT, 0o644)
 i=0
@@ -118,7 +119,7 @@ while True:
     os.pwrite(fd, ("TICK%08d" % i).encode().ljust(4096, b"."), i*4096)
     os.fsync(fd)
     blk0=os.pread(fd,12,0).decode()
-    print("TICK %d DISK blk0=%s" % (i, blk0), flush=True)
+    print("TICK %d DISK blk0=%s NONCE=%s" % (i, blk0, nonce), flush=True)
     i+=1
     time.sleep(0.25)'
 PYCODE_JSON="$(printf '%s' "$PYCODE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
@@ -154,10 +155,12 @@ boot:
 EOF
 }
 
+SOURCE_NONCE=""
 wait_tick() {
-    local log=$1 pid=$2 tick=$3
+    local log=$1 pid=$2 tick=$3 nonce='[0-9a-f]{32}'
+    nonce=${SOURCE_NONCE:-$nonce}
     for _ in $(seq 1 600); do
-        grep -qE "^TICK $tick DISK blk0=TICK00000000$" "$log" 2>/dev/null && return 0
+        grep -qE "^TICK $tick DISK blk0=TICK00000000 NONCE=$nonce$" "$log" 2>/dev/null && return 0
         kill -0 "$pid" 2>/dev/null || {
             tail -60 "$log" >&2 || true
             return 1
@@ -165,6 +168,22 @@ wait_tick() {
         sleep 0.05
     done
     return 1
+}
+
+last_tick() {
+    local tick
+    if ! tick=$(awk -v marker="DISK blk0=TICK00000000 NONCE=$SOURCE_NONCE" '
+        /^TICK([[:space:]]|$)/ { last = $0 }
+        END {
+            n = split(last, fields, " ")
+            if (n != 5 || fields[2] !~ /^[0-9]+$/ ||
+                last != "TICK " fields[2] " " marker) exit 1
+            print fields[2]
+        }' "$1"); then
+        echo "FAIL: missing or invalid final TICK/process/disk record in $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$tick"
 }
 
 SID="local-merge-$BASHPID"
@@ -183,7 +202,13 @@ S1="$SNAPDIR/$SID.snapshot"
 [ -e "$S1" ] || e2e_fail "first local snapshot is missing"
 FROM1="$("$BIN/sandbox-ctl" info --json "$S1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')"
 [ "$FROM1" = "[]" ] || e2e_fail "first local snapshot unexpectedly has parents: $FROM1"
-TICK1="$(grep -oE '^TICK [0-9]+' "$LOG1" | tail -1 | awk '{print $2}')"
+# Capture has stopped the source and drained its output. This nonce exists only
+# in guest process memory; a cold restart cannot pass by counting up again.
+SOURCE_RECORD="$(awk '/^TICK([[:space:]]|$)/ { last=$0 } END { print last }' "$LOG1")"
+[[ "$SOURCE_RECORD" =~ ^TICK\ ([0-9]+)\ DISK\ blk0=TICK00000000\ NONCE=([0-9a-f]{32})$ ]] || \
+    e2e_fail "missing or invalid final source process/disk record: $SOURCE_RECORD"
+TICK1="${BASH_REMATCH[1]}"
+SOURCE_NONCE="${BASH_REMATCH[2]}"
 
 write_restore_config "$WORK/restore2.yaml" "$WORK/restore2.diff"
 LOG2="$OUT/restore2.log"
@@ -198,7 +223,7 @@ PIDS=("$STORE_PID" "$CACHE_PID")
 S2="$SNAPDIR/$SID.snapshot"
 FROM2="$("$BIN/sandbox-ctl" info --json "$S2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')"
 [ "$FROM2" = "[]" ] || e2e_fail "same-owner local parent stacked instead of merging: $FROM2"
-TICK2="$(grep -oE '^TICK [0-9]+' "$LOG2" | tail -1 | awk '{print $2}')"
+TICK2="$(last_tick "$LOG2")"
 
 write_restore_config "$WORK/restore3.yaml" "$WORK/restore3.diff"
 LOG3="$OUT/restore3.log"
