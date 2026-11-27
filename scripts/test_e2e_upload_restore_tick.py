@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ROOT / "test/e2e/cases"
 ENV = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+NONCE = "0123456789abcdef0123456789abcdef"
 
 
 def function(source, name):
@@ -27,7 +28,8 @@ class SnapshotTickTests(unittest.TestCase):
         for name, ordinal, counter in phases:
             source = (CASES / name).read_text()
             begin = source.index(f"SNAP{ordinal}=$(")
-            end = re.search(r"(?m)^" + counter + r'=\$\(last_tick[^\n]+', source[begin:])
+            sample = r'^SOURCE_NONCE=[^\n]+' if ordinal == 1 else r'^' + counter + r'=\$\(last_tick[^\n]+'
+            end = re.search(r"(?m)" + sample, source[begin:])
             self.assertIsNotNone(end)
             sequence = source[begin:begin + end.end()]
             helpers = function(source, "last_tick")
@@ -40,16 +42,17 @@ class SnapshotTickTests(unittest.TestCase):
             with self.subTest(case=name, snapshot=ordinal), tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 binary = work / "sandbox-ctl"
-                binary.write_text('#!/bin/bash\nprintf "TICK 17 DISK blk0=TICK00000000\\n" >> "$TEST_LOG"\nprintf "%064d\\n" 1\n')
+                binary.write_text('#!/bin/bash\nprintf "TICK 17 DISK blk0=TICK00000000 NONCE=%s\\n" "$TEST_NONCE" >> "$TEST_LOG"\nprintf "%064d\\n" 1\n')
                 binary.chmod(0o755)
                 setup = r'''
 WORK=$TEST_WORK; BIN=$WORK; OUT=$WORK; RUN_ROOT=$WORK/run
+SOURCE_NONCE=$TEST_NONCE
 LOG1=$WORK/source.log; LOG2=$LOG1; LOG3=$LOG1; LOG4=$LOG1
 export TEST_LOG=$LOG1
 SID1=source; SID2=source; SID3=source
-printf 'TICK 10 DISK blk0=TICK00000000\n' > "$LOG1"
+printf 'TICK 10 DISK blk0=TICK00000000 NONCE=%s\n' "$TEST_NONCE" > "$LOG1"
 mkfifo "$WORK/drain"
-( read -r _ < "$WORK/drain"; printf 'TICK 22 DISK blk0=TICK00000000\n' >> "$LOG1" ) &
+( read -r _ < "$WORK/drain"; printf 'TICK 22 DISK blk0=TICK00000000 NONCE=%s\n' "$TEST_NONCE" >> "$LOG1" ) &
 source_pid=$!
 STORE_PID=$source_pid
 PID1=$source_pid; PID2=$source_pid; PID3=$source_pid; PID4=$source_pid
@@ -65,23 +68,108 @@ e2e_fail() { echo "$*" >&2; exit 1; }
 wait_tick() { [[ "$2" == 25 ]]; }
 '''
                 result = subprocess.run(["bash", "-euo", "pipefail", "-c", setup + helpers + "\n" + sequence + "\n" + use],
-                                        env={**ENV, "TEST_WORK": directory}, capture_output=True, text=True, timeout=5)
+                                        env={**ENV, "TEST_WORK": directory, "TEST_NONCE": NONCE}, capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_missing_or_invalid_final_record_fails(self):
-        invalid = ("", "TICK nope DISK blk0=TICK00000000\n", "TICK 22 DISK blk0=CORRUPTED\n",
-                   "TICK 21 DISK blk0=TICK00000000\nTICK 22 DISK blk0=CORRUPTED\n",
-                   "TICK 22\nDISK blk0=TICK00000000\n")
-        for name in ("snapshot.remote-roundtrip.sh", "snapshot.remote-chain.sh"):
+        invalid = ("", f"TICK nope DISK blk0=TICK00000000 NONCE={NONCE}\n",
+                   f"TICK 22 DISK blk0=CORRUPTED NONCE={NONCE}\n",
+                   f"TICK 21 DISK blk0=TICK00000000 NONCE={NONCE}\nTICK 22 DISK blk0=CORRUPTED NONCE={NONCE}\n",
+                   "TICK 22\nDISK blk0=TICK00000000\n", "TICK 22 DISK blk0=TICK00000000\n",
+                   "TICK 22 DISK blk0=TICK00000000 NONCE=ffffffffffffffffffffffffffffffff\n")
+        for name in ("snapshot.remote-roundtrip.sh", "snapshot.remote-chain.sh", "snapshot.local-merge.sh"):
             helper = function((CASES / name).read_text(), "last_tick")
             for content in invalid:
                 with self.subTest(case=name, content=content), tempfile.TemporaryDirectory() as directory:
                     path = Path(directory) / "source.log"
                     path.write_text(content)
                     result = subprocess.run(["bash", "-euo", "pipefail", "-c", helper + '\nlast_tick "$1"', "test", str(path)],
-                                            env=ENV, capture_output=True, text=True, timeout=5)
+                                            env={**ENV, "SOURCE_NONCE": NONCE}, capture_output=True, text=True, timeout=5)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("missing or invalid final TICK", result.stderr)
+
+    def test_restored_tick_requires_captured_process_nonce(self):
+        for name in ("snapshot.remote-roundtrip.sh", "snapshot.remote-chain.sh", "snapshot.local-merge.sh"):
+            helper = function((CASES / name).read_text(), "wait_tick")
+            call = 'wait_tick "$1" "$$" 25' if name == "snapshot.local-merge.sh" else 'wait_tick "$1" 25 "$$"'
+            setup = 'seq() { printf "1\\n"; }; sleep() { :; }; e2e_fail() { exit 1; };\n'
+            for label, record, accepted in (
+                ("retained process", f"TICK 25 DISK blk0=TICK00000000 NONCE={NONCE}\n", True),
+                ("cold process caught up", "TICK 25 DISK blk0=TICK00000000 NONCE=ffffffffffffffffffffffffffffffff\n", False),
+                ("disk corruption", f"TICK 25 DISK blk0=CORRUPTED NONCE={NONCE}\n", False),
+                ("missing process identity", "TICK 25 DISK blk0=TICK00000000\n", False),
+            ):
+                with self.subTest(case=name, record=label), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "restore.log"
+                    path.write_text(record)
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", setup + helper + "\n" + call,
+                                             "test", str(path)], env={**ENV, "SOURCE_NONCE": NONCE},
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+
+
+class RestoreConfigIdentityTests(unittest.TestCase):
+    def exercise(self, final_record, restored_log):
+        source = (CASES / "snapshot.restore-config.sh").read_text()
+        begin = source.index('"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1"')
+        capture = source[begin:source.index('\nSNAPSHOT=', begin)]
+        predicate = function(source, "restored_process_progressed")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "restore.log").write_text(restored_log)
+            binary = work / "sandbox-ctl"
+            binary.write_text('#!/bin/bash\nprintf "TICK 17 ID=none NONCE=%s\\n" "$TEST_NONCE" >> "$TEST_LOG"\n')
+            binary.chmod(0o755)
+            setup = r'''
+WORK=$TEST_WORK; BIN=$WORK; OUT=$WORK; SID1=source
+LOG1=$WORK/source.log; LOG2=$WORK/restore.log
+export TEST_LOG=$LOG1
+printf 'TICK 10 ID=none NONCE=%s\n' "$TEST_NONCE" > "$LOG1"
+mkfifo "$WORK/drain"
+( read -r _ < "$WORK/drain"; printf '%s' "$FINAL_RECORD" > "$LOG1" ) &
+PID1=$!
+source_pid=$PID1
+trap 'kill "$source_pid" 2>/dev/null || :; builtin wait "$source_pid" 2>/dev/null || :' EXIT
+source_shell=$BASHPID
+wait() {
+    [[ $BASHPID == "$source_shell" ]] || return 1
+    printf 'drain\n' > "$WORK/drain"
+    builtin wait "$@"
+}
+e2e_fail() { echo "$*" >&2; exit 1; }
+'''
+            check = '\nrestored_process_progressed || e2e_fail "restored identity or progress failed"\n'
+            return subprocess.run(["bash", "-euo", "pipefail", "-c", setup + capture + "\n" + predicate + check],
+                                  env={**ENV, "TEST_WORK": directory, "TEST_NONCE": NONCE,
+                                       "FINAL_RECORD": final_record}, capture_output=True, text=True, timeout=5)
+
+    def test_capture_drains_output_before_matching_identity_and_progress(self):
+        result = self.exercise(f"TICK 22 ID=none NONCE={NONCE}\n",
+                               f"TICK 23 ID=none NONCE={NONCE}\nTICK 25 ID=none NONCE={NONCE}\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cold_restart_or_missing_progress_cannot_pass(self):
+        for record in ("TICK 100000 ID=none NONCE=ffffffffffffffffffffffffffffffff\n",
+                       f"TICK 24 ID=none NONCE={NONCE}\n", f"TICK 25 ID=clone-42 NONCE={NONCE}\n",
+                       "TICK 25 ID=none\n", f"TICK 25 ID=none NONCE={NONCE} extra\n", ""):
+            with self.subTest(record=record):
+                result = self.exercise(f"TICK 22 ID=none NONCE={NONCE}\n", record)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("restored identity or progress failed", result.stderr)
+
+    def test_different_process_cannot_be_hidden_by_a_matching_record(self):
+        result = self.exercise(f"TICK 22 ID=none NONCE={NONCE}\n",
+                               f"TICK 25 ID=none NONCE={NONCE}\n"
+                               "TICK 26 ID=none NONCE=ffffffffffffffffffffffffffffffff\n")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_or_malformed_final_source_record_fails(self):
+        for record in ("", "TICK 22 ID=none\n", "TICK nope ID=none NONCE=" + NONCE + "\n",
+                       f"TICK 22 ID=none NONCE={NONCE}\nTICK broken\n"):
+            with self.subTest(record=record):
+                result = self.exercise(record, f"TICK 25 ID=none NONCE={NONCE}\n")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing or invalid final source process record", result.stderr)
 
 
 class LocalRestoreTickTests(unittest.TestCase):
