@@ -2,9 +2,10 @@
 
 # sandboxer
 
-部署 Kuasar Sandbox 并运行应用，从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)
-选择聚合发行版，再按[节点基础设施指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)
-完成持久部署。直接使用本组件时，采用匹配的发布二进制并按[独立使用流程](docs/runtime_zh.md#standalone-workflow)操作。
+按项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)，
+用 `docker pull` 和 `docker run` 启动首个 Sandbox；node-infra 镜像包含相互匹配的平台组件。
+随后按[节点基础设施指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)
+配置持久节点。直接使用本组件时，采用匹配的发布二进制并按[独立使用流程](docs/runtime_zh.md#standalone-workflow)操作。
 源码构建及 [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)
 用于开发、演示和验证。预构建架构以所选发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
 
@@ -143,8 +144,8 @@ Go import surface 保持窄边界:
 | `connector` | `pkg/tapfd` | 接收 TAP 与 network namespace file descriptor |
 | `guest-runtime` | `pkg/guestabi/{proto,mux,fwd}` | Guest 控制协议、多路复用与转发；guest 不依赖 host 生命周期实现 |
 
-独立 Go 构建解析 `go.mod` 中提交的依赖版本。协调开发（包括依赖配套版本尚未发布的 main 或 PR
-源码）时，检出选定的 `sandboxer`、`accelerator`、`connector` 和 `guest-runtime` revision，再生成依赖工作区：
+独立 Go 构建解析 `go.mod` 中提交的依赖版本。跨仓源码构建时，检出相互兼容的 `sandboxer`、
+`accelerator`、`connector` 和 `guest-runtime` revision，再生成依赖工作区：
 
 ```bash
 GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer --source-requirements)" || exit 1
@@ -152,8 +153,8 @@ export GOWORK
 make build
 ```
 
-工作区使用选定本地模块，并为其声明的内部依赖生成限定版本的 workspace 绑定，避免 Go 抓取尚未
-发布的配套版本元数据；不改写 `go.mod`/`go.sum`，helper 构建继承同一选择。发行复现使用下文的专用
+工作区使用选定本地模块，并为其声明的内部依赖生成限定版本的 workspace 绑定。内部依赖的
+元数据来自这些本地 checkout；不改写 `go.mod`/`go.sum`，helper 构建继承同一选择。发行复现使用下文的专用
 release target 及精确 Tag/源码核验。Patched Cloud Hypervisor、Guest Runtime、Kernel 仍是独立的
 Native/Runtime 前置。完整系统见[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)。
 

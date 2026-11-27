@@ -525,13 +525,12 @@ kick 即可重试尚未开始的请求；已开始的 I/O 仍须完成排空。�
 预热实例 Launch 与磁盘 slot 绑定不会重置额度；内存恢复使用目标 Host 合并后的 QoS
 策略，制品不携带该策略。
 
-**升级注意：** 旧版省略脏页额度时取最终缓存的一半，本轮改为不增加额外限制，实际
-脏页内存仍受缓存授额约束。旧版规范化配置中已写出的显式正值继续生效；重新生成配置
-或覆盖 `max_dirty_size: 0` 才会采用新默认。应先升级 `sandbox-ctl` / Sandboxer SDK，
-再使用新 Orchestrator 默认配置：旧版既拒绝新增字段，也拒绝显式的 0 脏页额度，而新版
-默认 Host YAML 会包含这个 0。缓存本身没有无限制大小、关闭开关或 DIO 数据操作失败
-后的 buffered 重试。上述控制是 Host policy，不进入 Sandbox E 与 Snapshot S 的
-portable 身份。
+**升级兼容性：** 省略脏页额度或设置 `max_dirty_size: 0` 均不增加额外限制，实际脏页内存
+仍受缓存授额约束。默认取最终缓存一半的旧版本生成的配置包含显式正值，该限制继续生效；
+重新生成配置或设置 `max_dirty_size: 0` 才会采用默认策略。使用相互匹配的 `sandbox-ctl` /
+Sandboxer SDK 与 Orchestrator：拒绝 0 脏页额度或不支持 QoS 字段的旧 reader 无法读取默认
+Host YAML。缓存本身没有无限制大小、关闭开关或 DIO 数据操作失败后的 buffered 重试。
+上述控制是 Host policy，不进入 Sandbox E 与 Snapshot S 的 portable 身份。
 
 缓存物理页仍计入 `sandbox-ctl` 所属 `ctl/` cgroup，不修改 Guest 内存预算、balloon
 或 `vmm/` 控制。共享物理盘的 runner/builder unit 配置与有条件生效的 DIO 优先级见

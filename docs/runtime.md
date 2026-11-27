@@ -27,11 +27,9 @@ snapshot as an independent instance. There is no separate live-fork CLI or SDK;
 | Disk checkpoint list/delete/GC and `Disk` APIs | [Block storage](block-storage.md#checkpoints) |
 | Usage commands and resource accounting | [Resources](resources.md#usage-cli) |
 
-This guide describes the current source revision. A selected platform release
-may pin different component versions; use its included guides and matching
-artifacts. The current reader rejects the old `snapshot.cfg` disk-graph schema;
-there is no dual reader, automatic migration or arbitrary cross-version restore
-guarantee. See [artifact compatibility](artifacts.md#compatibility).
+Use the guides and matching artifacts from the same selected platform release.
+The reader rejects the legacy `snapshot.cfg` disk-graph schema; there is no dual
+reader, automatic migration or arbitrary cross-version restore guarantee. See [artifact compatibility](artifacts.md#compatibility).
 
 <a id="standalone-workflow"></a>
 

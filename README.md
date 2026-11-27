@@ -2,11 +2,11 @@
 
 # sandboxer
 
-To deploy Kuasar Sandbox and run applications, start with the project
-[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
-using a selected aggregate release, then follow the
+Run your first sandbox with `docker pull` and `docker run` in the project
+[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md).
+The node-infra image includes the matching platform components. Follow the
 [node infrastructure guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md)
-for a persistent installation. To use this component directly, follow the
+to configure a persistent node. To use this component directly, follow the
 [standalone workflow](docs/runtime.md#standalone-workflow) with the matching
 published binaries. Source builds and
 [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md)
@@ -157,8 +157,7 @@ The Go import surface is intentionally narrow:
 | `guest-runtime` | `pkg/guestabi/{proto,mux,fwd}` | Guest control protocol, multiplexing and forwarding; no host lifecycle dependency in the guest |
 
 Standalone Go builds resolve the dependency versions committed in `go.mod`.
-For coordinated development, including main or PR sources whose companion versions
-are not yet published, check out the selected `sandboxer`, `accelerator`,
+For a coordinated source build, check out compatible `sandboxer`, `accelerator`,
 `connector` and `guest-runtime` revisions and generate their dependency workspace:
 
 ```bash
@@ -168,8 +167,8 @@ make build
 ```
 
 The workspace uses the selected local modules and adds version-specific workspace
-bindings for their declared internal requirements. This prevents Go from fetching
-an unpublished companion version's module metadata; `go.mod`/`go.sum` stay unchanged.
+bindings for their declared internal requirements. Internal dependency metadata
+comes from those local checkouts; `go.mod`/`go.sum` stay unchanged.
 Helper builds inherit the same selection. Release reproduction uses the dedicated
 release targets below and their exact tag/source checks. Patched Cloud
 Hypervisor, Guest Runtime and Kernel remain separate native/runtime prerequisites.

@@ -23,8 +23,8 @@
 | 磁盘 checkpoint list/delete/GC 与 `Disk` API | [块存储](block-storage_zh.md#checkpoints) |
 | Usage 命令与资源计量 | [资源](resources_zh.md#usage-cli) |
 
-本指南对应当前源码。平台发行版可能选择不同组件版本，应使用该版本附带的指南及匹配制品。
-当前 reader 拒绝旧 `snapshot.cfg` 磁盘图 schema；不提供双 reader、自动迁移或任意版本恢复保证。
+使用同一选定平台发行版附带的指南及匹配制品。Reader 拒绝旧 `snapshot.cfg` 磁盘图 schema；
+不提供双 reader、自动迁移或任意版本恢复保证。
 具体见[制品兼容性](artifacts_zh.md#compatibility)。
 
 <a id="standalone-workflow"></a>
