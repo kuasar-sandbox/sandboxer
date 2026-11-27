@@ -264,7 +264,7 @@ timeout -k 10s 180 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --manifest-
 P1=$!
 PIDS+=("$P1")
 ready "$SID1" "$P1" "$OUT/run-a.log"
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RR" -- /bin/sh -c \
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RR" -- /bin/sh -ec \
     'echo ROOT-BASE > /bundle-root; echo DATA-BASE > /scratch/bundle-data; sync'
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$OUT1" --mode bundle --run-root "$RR" >"$OUT/snapshot-a.out" 2>"$OUT/snapshot-a.log"
 wait "$P1" 2>/dev/null || true
@@ -287,7 +287,7 @@ timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$LOCATED_A" --ref-location 
 P2=$!
 PIDS+=("$P2")
 ready "$SID2" "$P2" "$OUT/run-b.log"
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RR" -- /bin/sh -c \
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RR" -- /bin/sh -ec \
     'grep -qx ROOT-BASE /bundle-root; grep -qx DATA-BASE /scratch/bundle-data; echo ROOT-CHILD > /bundle-root-child; echo DATA-CHILD > /scratch/bundle-data-child; sync'
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID2" --output "$OUT2" --mode bundle --merge-ref=false --drop-caches=false --run-root "$RR" >"$OUT/snapshot-b.out" 2>"$OUT/snapshot-b.log"
 wait "$P2" 2>/dev/null || true
@@ -313,7 +313,7 @@ timeout -k 10s 180 "$BIN/sandbox-ctl" run --restore "$LOCATED_B" --ref-location 
 P3=$!
 PIDS+=("$P3")
 ready "$SID3" "$P3" "$OUT/run-c.log"
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RR" -- /bin/sh -c \
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RR" -- /bin/sh -ec \
     'grep -qx ROOT-BASE /bundle-root; grep -qx ROOT-CHILD /bundle-root-child; grep -qx DATA-BASE /scratch/bundle-data; grep -qx DATA-CHILD /scratch/bundle-data-child; echo ROOT-C > /bundle-root-c; echo DATA-C > /scratch/bundle-data-c; sync'
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID3" --output "$OUT3" --mode bundle --merge-ref=false --drop-caches=false --run-root "$RR" >"$OUT/snapshot-c.out" 2>"$OUT/snapshot-c.log"
 wait "$P3" 2>/dev/null || true
