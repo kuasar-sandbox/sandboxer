@@ -50,6 +50,46 @@ ip link set "$TAP_NAME" up
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
+free_cache_ports() {
+    python3 - <<'PY'
+import socket
+with socket.socket() as data, socket.socket() as health:
+    data.bind(("", 0))
+    health.bind(("", 0))
+    print(data.getsockname()[1], health.getsockname()[1])
+PY
+}
+cache_startup_diagnostics() {
+    cat "$OUT/cache.log" >&2 || true
+    [ ! -f "$OUT/cache-probe.log" ] || cat "$OUT/cache-probe.log" >&2 || true
+}
+require_cache_alive() {
+    local status=0
+    if kill -0 "$CACHE_PID" 2>/dev/null; then
+        return
+    fi
+    wait "$CACHE_PID" || status=$?
+    cache_startup_diagnostics
+    e2e_fail "cache exited before ready (exit=$status)"
+}
+wait_cache_ready() {
+    for _ in $(seq 1 100); do
+        require_cache_alive
+        if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>>"$OUT/cache-probe.log" | grep -qx SERVING; then
+            require_cache_alive
+            break
+        fi
+        require_cache_alive
+        sleep 0.05
+    done
+    require_cache_alive
+    if ! "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>>"$OUT/cache-probe.log" | grep -qx SERVING; then
+        require_cache_alive
+        cache_startup_diagnostics
+        e2e_fail "cache did not become ready"
+    fi
+    require_cache_alive
+}
 KEY="$(openssl rand -hex 32)"
 STORE_PORT="$(free_port)"
 cat >"$WORK/store.yaml" <<EOF
@@ -67,8 +107,8 @@ for _ in $(seq 1 100); do
 done
 (echo >/dev/tcp/127.0.0.1/"$STORE_PORT") 2>/dev/null || e2e_fail "store did not become ready"
 
-CACHE_PORT="$(free_port)"
-CACHE_HEALTH_PORT="$(free_port)"
+CACHE_PORTS="$(free_cache_ports)"
+read -r CACHE_PORT CACHE_HEALTH_PORT <<<"$CACHE_PORTS"
 cat >"$WORK/cache.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$CACHE_PORT
@@ -86,13 +126,7 @@ EOF
 "$BIN/cache-ctl" serve --config "$WORK/cache.yaml" >"$OUT/cache.log" 2>&1 &
 CACHE_PID=$!
 PIDS+=("$CACHE_PID")
-for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -qx SERVING; then
-        break
-    fi
-    sleep 0.05
-done
-"$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -qx SERVING || e2e_fail "cache did not become ready"
+wait_cache_ready
 
 cat >"$WORK/manifest.yaml" <<EOF
 manifest: { key: "$KEY" }
