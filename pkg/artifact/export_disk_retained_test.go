@@ -69,8 +69,21 @@ func TestExportDiskRetainsPublishedGraphWithoutStorageAccess(t *testing.T) {
 			if destination == "named" {
 				req.ToRefLocation = config.RefLocations{"output": output}
 			}
-			disk, err := reader.ExportDisk(ctx, req)
-			requireDiskIO(t, err)
+			var disk DiskV1
+			if req.Upload {
+				result, e := reader.ExportDiskWithReport(ctx, req)
+				requireDiskIO(t, e)
+				disk = result.Disk
+				report, e := result.Report()
+				requireDiskIO(t, e)
+				requireReferenceSet(t, report.DiskRefs, append([]string{base}, parents...)...)
+				if !report.Refs || report.RemovedRefs == nil || len(report.RemovedRefs) != 0 {
+					t.Fatalf("all-retained report: %+v", report)
+				}
+			} else {
+				disk, err = reader.ExportDisk(ctx, req)
+				requireDiskIO(t, err)
+			}
 			requireDiskIO(t, disk.Validate())
 			if disk.Base != base || !slices.Equal(disk.BaseFromRefs, parents) || *disk.Size != 16384 {
 				t.Fatalf("published graph changed: %+v", disk)
@@ -148,12 +161,18 @@ func testExportDiskMaterializesOnlyPrivateLayers(t *testing.T, named bool) {
 func TestExportDiskRetainsSelectedNamedBundleWithoutReadingPayload(t *testing.T) {
 	for _, borrowed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("borrowed=%t", borrowed), func(t *testing.T) {
-			testExportDiskRetainsSelectedNamedBundle(t, borrowed)
+			testExportDiskRetainsSelectedNamedBundle(t, borrowed, false)
 		})
 	}
 }
 
-func testExportDiskRetainsSelectedNamedBundle(t *testing.T, borrowed bool) {
+func TestExportDiskReportSelectedNamedBundle(t *testing.T) {
+	for _, borrowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("borrowed=%t", borrowed), func(t *testing.T) { testExportDiskRetainsSelectedNamedBundle(t, borrowed, true) })
+	}
+}
+
+func testExportDiskRetainsSelectedNamedBundle(t *testing.T, borrowed, withReport bool) {
 	t.Helper()
 	ctx := context.Background()
 	cfg, key := sourceBundleConfig(manifestcrypto.LocalOff)
@@ -191,8 +210,28 @@ func testExportDiskRetainsSelectedNamedBundle(t *testing.T, borrowed bool) {
 		reader, sourceRef = storage.BorrowWithFetcher(bundle.ScopedFetcher()), root
 		defer reader.Close()
 	}
-	disk, err := reader.ExportDisk(ctx, ExportDiskRequest{SourceRef: sourceRef, DiskName: "work", OutputDir: output, RefLocations: locations})
-	requireDiskIO(t, err)
+	req := ExportDiskRequest{SourceRef: sourceRef, DiskName: "work", OutputDir: output, RefLocations: locations}
+	var disk DiskV1
+	if withReport {
+		req.Upload, req.OutputDir, req.ToRefLocation = true, "", config.RefLocations{"output": output}
+		result, e := reader.ExportDiskWithReport(ctx, req)
+		requireDiskIO(t, e)
+		disk = result.Disk
+		report, e := result.Report()
+		requireDiskIO(t, e)
+		requireReferenceSet(t, report.DiskRefs, append([]string{disk.Base}, disk.BaseFromRefs...)...)
+		wantRemoved := 1
+		if borrowed {
+			wantRemoved = 0
+		} // borrowed private carrier has no public old-file identity
+		if len(report.RemovedRefs) != wantRemoved {
+			t.Fatalf("selected Bundle delta=%v", report.RemovedRefs)
+		}
+		locations["output"] = output
+	} else {
+		disk, err = reader.ExportDisk(ctx, req)
+		requireDiskIO(t, err)
+	}
 	parentKey, err := manifest.ParseKeyRef(parent)
 	requireDiskIO(t, err)
 	wantParent := bundleMemberRef(named, parentKey)

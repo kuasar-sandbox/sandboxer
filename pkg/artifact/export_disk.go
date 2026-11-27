@@ -48,7 +48,33 @@ type savedDiskLayer struct {
 
 // ExportDisk publishes one named data disk at a committed E or paired S/E
 // point. It never takes an online checkpoint or consumes an existing one.
-func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) (out DiskV1, retErr error) {
+func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) (DiskV1, error) {
+	return s.exportDisk(ctx, req, nil)
+}
+
+// ExportDiskWithReport uploads the selected disk once and returns its complete
+// layer set and known old-layer delta. Local --output keeps ExportDisk's contract.
+func (s *ProcessStorage) ExportDiskWithReport(ctx context.Context, req ExportDiskRequest) (DiskExportResult, error) {
+	if !req.Upload {
+		return DiskExportResult{}, errors.New("disk reference report requires upload")
+	}
+	var before []string
+	disk, err := s.exportDisk(ctx, req, &before)
+	if err != nil {
+		return DiskExportResult{}, err
+	}
+	refs, err := canonicalReferences(append([]string{disk.Base}, disk.BaseFromRefs...))
+	if err != nil {
+		return DiskExportResult{}, err
+	}
+	removed, err := referenceDifference(before, refs)
+	if err != nil {
+		return DiskExportResult{}, err
+	}
+	return DiskExportResult{Disk: disk, DiskRefs: refs, RemovedRefs: removed}, nil
+}
+
+func (s *ProcessStorage) exportDisk(ctx context.Context, req ExportDiskRequest, before *[]string) (out DiskV1, retErr error) {
 	if req.SourceRef == "" || req.DiskName == "" || req.Upload == (req.OutputDir != "") {
 		return out, errors.New("disk export requires source, disk name and exactly one destination")
 	}
@@ -82,12 +108,22 @@ func (s *ProcessStorage) ExportDisk(ctx context.Context, req ExportDiskRequest) 
 		return out, errors.New("source directory must be absolute")
 	}
 	p := newPublisher(s, req.RefLocations, nil, nil)
+	if before != nil {
+		p.report = &publicationReport{}
+	}
 	err := p.withDiskTable(ctx, req, func(cfg *config.PortableSandboxConfig, cp *sandboxfile.Checkpoint, scope publishScope) error {
 		layers, e := p.openSavedDisk(ctx, cfg, cp, scope, req.DiskName)
 		if e != nil {
 			return e
 		}
 		out, e = s.publishSavedDisk(ctx, req, layers)
+		if e == nil && before != nil {
+			for _, item := range p.report.before {
+				if ref, known := knownScopedRef(item.raw, item.scope); known {
+					*before = append(*before, ref)
+				}
+			}
+		}
 		return e
 	})
 	if err != nil {
@@ -117,6 +153,7 @@ func (p *Publisher) withDiskTable(ctx context.Context, req ExportDiskRequest, re
 	// A borrowed Bundle can select a named parent even when its own carrier
 	// has no path. Keep that selection for the shared publication ref policy.
 	scope.bindings = make(map[string]string)
+	scope.unbound = make(map[string]bool)
 	root, scope, err := p.open(ctx, raw, scope)
 	if err != nil {
 		return err
@@ -207,6 +244,9 @@ func (p *Publisher) openSavedDisk(ctx context.Context, cfg *config.PortableSandb
 		refs := append([]string{disk.Base}, disk.BaseFromRefs...)
 		compact := len(layers)+len(refs) > config.MaxPortableLayerRefs+1
 		for _, raw := range refs {
+			if p.report != nil {
+				p.original(raw, scope)
+			}
 			portable, keep, e := p.keepSavedDiskLayer(ctx, raw, scope)
 			if e != nil {
 				return layers, e

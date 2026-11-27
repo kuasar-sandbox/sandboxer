@@ -618,7 +618,7 @@ A Snapshot always contains memory execution state. One operation produces E and 
 Human-readable local output lists both `Snapshot S` and `Sandbox E`. Default upload stdout still contains only the S Manifest key for shell compatibility. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph. The legacy field name `memory_resident` counts explicit logical memory coverage (Data plus Zero), including released pages retained as Zero; it is neither physical residency nor encoded payload size.
 
 `snapshot --json` emits exactly `{snapshotRef,sandboxRef,removedRefs}` and
-`export --json` emits exactly `{sandboxRef,removedRefs}`, with `removedRefs:[]`
+local E `export --output DIR --json` emits exactly `{sandboxRef,removedRefs}`, with `removedRefs:[]`
 for capture. These identities come from the completed runtime response (or the
 assembly producer for `export --from`). The CLI does not reopen S or infer E
 from a filename. A single-root Bundle binds both selectors to the actual final
@@ -628,6 +628,14 @@ location. The output directory stays in the caller's execution context. Invalid
 or incomplete responses produce an error and no successful JSON. `--resume`
 uses the same identity contract; existing default human output and upload-key
 stdout remain available without `--json`.
+
+`export --upload --json` returns the complete E publication report described in
+[publication results](artifacts.md#publication-report). This applies to live
+capture and `--from` assembly; it does not change any `snapshot` output. The
+live upload report uses a distinct control request so an older owner rejects
+it before capture. Its response is chunked within the existing 64 KiB control
+frame limit; references are neither truncated nor downgraded to unknown because
+the complete report exceeds one frame.
 
 For paired RFC-142 deployment, upgrade sandboxer together with orchestrator.
 Operators must clear the old orchestrator local database before upgrading and

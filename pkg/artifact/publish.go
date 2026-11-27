@@ -39,6 +39,11 @@ type PublishResult struct {
 	Ref  string
 	// SandboxRef is the final E, including its selected carrier binding.
 	SandboxRef string
+	// Refs reports whether both applicable final reference groups are complete.
+	// Group entries retain full internal source scope until Report is called.
+	Refs         bool
+	SnapshotRefs []string
+	SandboxRefs  []string
 	// RemovedRefs retain full internal source scope. Use Report for public output.
 	RemovedRefs       []string
 	checkpointSources []checkpointPublication
@@ -334,7 +339,9 @@ type publishScope struct {
 	relativeDir string
 	carrier     string
 	bindings    map[string]string
-	current     *manifestbundle.Reader
+	// unbound marks aliases selected from a borrowed carrier without a public identity.
+	unbound map[string]bool
+	current *manifestbundle.Reader
 }
 
 // PublishSource publishes one already-assembled logical image, Sandbox or Snapshot
@@ -422,7 +429,10 @@ func (p *Publisher) Publish(ctx context.Context, input string) (result PublishRe
 			return PublishResult{}, errors.Join(errors.New("runtime declaration requires a Snapshot root"), sandboxRoot.Close())
 		}
 		ref, err := p.publishSandboxRoot(ctx, rootRef, childScope, sandboxRoot)
-		return p.result(RoleSandbox, ref, ref), err
+		if err != nil {
+			return PublishResult{Role: RoleSandbox}, err
+		}
+		return p.result(RoleSandbox, ref, ref)
 	}
 	if readretry.IsTerminal(sandboxErr) || readerr.IsPermanent(sandboxErr) {
 		return PublishResult{}, sandboxErr
@@ -436,7 +446,10 @@ func (p *Publisher) Publish(ctx context.Context, input string) (result PublishRe
 		return PublishResult{}, fmt.Errorf("publish: logical root is neither a strict .sandbox nor .snapshot: %w", errors.Join(sandboxErr, snapshotErr))
 	}
 	ref, e, err := p.publishSnapshotRoot(ctx, rootRef, childScope, snapshotRoot)
-	return p.result(RoleSnapshot, ref, e), err
+	if err != nil {
+		return PublishResult{Role: RoleSnapshot}, err
+	}
+	return p.result(RoleSnapshot, ref, e)
 }
 
 func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, scope publishScope, root *sandboxfile.Root) (ref string, retErr error) {
@@ -497,6 +510,7 @@ func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, sco
 	if err != nil {
 		return "", err
 	}
+	p.sandboxGroup(rewritten)
 	return p.target.Put(ctx, RoleSandbox, source)
 }
 
@@ -556,18 +570,16 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 		return "", "", errors.Join(err, sandboxRoot.Close())
 	}
 	if keep && sandboxRoot.Checkpoint == nil {
-		if err := errors.Join(p.retainLocatedDisks(sandboxRoot.Portable, sandboxScope), sandboxRoot.Close()); err != nil {
+		if err := errors.Join(p.retainedSandboxGroup(ctx, sandboxRoot.Portable, sandboxScope), sandboxRoot.Close()); err != nil {
 			return "", "", err
 		}
 		cfg.SandboxRef = portable
-		p.retained(portable, scope)
 	} else {
 		cfg.SandboxRef, err = p.publishSandboxRoot(ctx, cfg.SandboxRef, sandboxScope, sandboxRoot)
 		if err != nil {
 			return "", "", err
 		}
 	}
-	p.retained(cfg.SandboxRef, publishScope{})
 	newConfig, err := snapshot.MarshalConfig(cfg)
 	if err != nil {
 		return "", "", err
@@ -576,21 +588,13 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 	if err != nil {
 		return "", "", err
 	}
+	p.report.snapshotRefs = append([]string{}, cfg.FromRefs...)
 	ref, err = p.target.Put(ctx, RoleSnapshot, source)
 	return ref, cfg.SandboxRef, err
 }
 
 func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, use rewriteUse) (ref string, retErr error) {
 	p.original(raw, scope)
-	defer func() {
-		if retErr == nil {
-			if ref == raw {
-				p.retained(ref, scope)
-			} else {
-				p.retained(ref, publishScope{})
-			}
-		}
-	}()
 	if portable, ok, err := p.keepPortable(ctx, raw, scope); err != nil {
 		return "", err
 	} else if ok {
@@ -640,15 +644,6 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 
 func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope publishScope) (ref string, retErr error) {
 	p.original(raw, scope)
-	defer func() {
-		if retErr == nil {
-			if ref == raw {
-				p.retained(ref, scope)
-			} else {
-				p.retained(ref, publishScope{})
-			}
-		}
-	}()
 	var stream fetch.Stream
 	var child publishScope
 	if portable, ok, err := p.keepPortable(ctx, raw, scope); err != nil {
@@ -792,6 +787,7 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 			child.carrier = scopedRef(raw, scope)
 			child.current = opened.BundleReader()
 			child.bindings = make(map[string]string)
+			child.unbound = make(map[string]bool)
 		}
 		return opened, child, nil
 	default:
@@ -805,7 +801,7 @@ func (p *Publisher) normalizeRoot(input string) (string, publishScope, error) {
 	}
 	if strings.HasPrefix(input, "file://") || strings.HasPrefix(input, "manifest://") {
 		ref, err := manifest.ParseRef(input)
-		return ref.String(), publishScope{fetcher: p.storage.Fetcher()}, err
+		return ref.String(), publishScope{fetcher: p.storage.Fetcher(), bindings: make(map[string]string), unbound: make(map[string]bool)}, err
 	}
 	path, err := filepath.Abs(input)
 	if err != nil {

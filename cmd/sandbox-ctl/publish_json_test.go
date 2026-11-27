@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -69,7 +70,7 @@ func TestPublishDefaultRefAutoRequiresCLIKey(t *testing.T) {
 				t.Fatalf("publish failed: %d, %s, %v", rc, stderr, files)
 			}
 			report, err := artifact.DecodePublishReport([]byte(stdout), artifact.RoleSandbox)
-			if err != nil || !strings.Contains(report.SandboxRef, "@hmac:") {
+			if err != nil || !report.Refs || !strings.Contains(report.SandboxRef, "@hmac:") || !slices.Equal(report.SandboxRefs, []string{report.SandboxRef}) {
 				t.Fatalf("published JSON: %s, %v", stdout, err)
 			}
 			b, err := os.ReadFile(filepath.Join(out, files[0].Name()))
@@ -101,6 +102,9 @@ func TestPublishDefaultRefAutoRequiresCLIKey(t *testing.T) {
 			sReport, err := artifact.DecodePublishReport([]byte(stdout), artifact.RoleSnapshot)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if !sReport.Refs || !slices.Equal(sReport.SnapshotRefs, []string{sReport.SnapshotRef}) || !slices.Equal(sReport.SandboxRefs, []string{sReport.SandboxRef}) {
+				t.Fatalf("encrypted publication lost its complete groups: %+v", sReport)
 			}
 			args[len(args)-1] = sReport.SnapshotRef
 			rc, info, stderr = captureInfoOutput(t, func() int { return infoCmd(args) })
@@ -188,14 +192,48 @@ func TestPublishJSONAliases(t *testing.T) {
 				if root == sPath && report.SandboxRef != info.Snapshot.SandboxRef {
 					t.Fatal("wrong final E")
 				}
-				var fields map[string]json.RawMessage
-				json.Unmarshal([]byte(stdout), &fields)
-				want := 2
-				if root == sPath {
-					want = 3
+				if !report.Refs || !slices.Equal(report.SandboxRefs, []string{report.SandboxRef}) {
+					t.Fatalf("incomplete fixture E group: %+v", report)
 				}
-				if len(fields) != want {
+				if root == sPath && !slices.Equal(report.SnapshotRefs, []string{report.SnapshotRef}) {
+					t.Fatalf("incomplete fixture S group: %+v", report)
+				}
+				oldRoot, err := artifact.PublicRef("file://" + root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantRemoved := []string{oldRoot}
+				if root == sPath {
+					oldE, err := artifact.PublicRef(eRef)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantRemoved = append(wantRemoved, oldE)
+					slices.Sort(wantRemoved)
+				}
+				if !slices.Equal(report.RemovedRefs, wantRemoved) {
+					t.Fatalf("known input delta = %v, want %v", report.RemovedRefs, wantRemoved)
+				}
+				for _, removed := range report.RemovedRefs {
+					if slices.Contains(report.SandboxRefs, removed) || slices.Contains(report.SnapshotRefs, removed) {
+						t.Fatalf("final graph overlaps removedRefs: %+v", report)
+					}
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(stdout), &fields); err != nil {
+					t.Fatal(err)
+				}
+				wantFields := []string{"refs", "sandboxRef", "sandboxRefs", "removedRefs"}
+				if root == sPath {
+					wantFields = append(wantFields, "snapshotRef", "snapshotRefs")
+				}
+				if len(fields) != len(wantFields) {
 					t.Fatalf("shape=%s", stdout)
+				}
+				for _, field := range wantFields {
+					if fields[field] == nil {
+						t.Fatalf("missing %s in %s", field, stdout)
+					}
 				}
 			}
 		}

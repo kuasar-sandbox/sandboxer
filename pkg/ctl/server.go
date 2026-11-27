@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -311,8 +312,12 @@ func (s *Server) handle(conn *net.UnixConn) {
 		}
 		return
 
-	case TypeExportRequest, TypeCheckpointExportRequest:
+	case TypeExportRequest, TypeCheckpointExportRequest, TypeExportReportRequest:
 		defer conn.Close()
+		if req.Type == TypeExportReportRequest && (!req.Upload || req.OutDir != "" || req.CheckpointID != "") {
+			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "export report requires upload without a local checkpoint"})
+			return
+		}
 		if s.ExportHandler == nil {
 			code := ""
 			if req.Type == TypeCheckpointExportRequest {
@@ -328,7 +333,11 @@ func (s *Server) handle(conn *net.UnixConn) {
 		} else {
 			resp.Type = TypeExportDone
 		}
-		if writeErr := writeCaptureResponse(conn, resp); writeErr != nil {
+		writeResponse := func(w io.Writer, r Response) error { return WriteMessage(w, r) }
+		if req.Type == TypeExportReportRequest {
+			writeResponse = WriteExportReportResponse
+		}
+		if writeErr := writeCaptureResponseWith(conn, resp, writeResponse); writeErr != nil {
 			s.Logf("ctl.sock: write export resp: %v", writeErr)
 		}
 		return
@@ -345,6 +354,10 @@ func (s *Server) handle(conn *net.UnixConn) {
 const captureResponseWriteTimeout = 5 * time.Second
 
 func writeCaptureResponse(conn net.Conn, resp Response) error {
+	return writeCaptureResponseWith(conn, resp, func(w io.Writer, r Response) error { return WriteMessage(w, r) })
+}
+
+func writeCaptureResponseWith(conn net.Conn, resp Response, write func(io.Writer, Response) error) error {
 	if resp.BeforeWrite != nil {
 		if err := resp.BeforeWrite(); err != nil {
 			resp.Type = TypeError
@@ -361,7 +374,7 @@ func writeCaptureResponse(conn net.Conn, resp Response) error {
 			return err
 		}
 	}
-	return WriteMessage(conn, resp)
+	return write(conn, resp)
 }
 
 func (s *Server) detachResponse(conn net.Conn) {

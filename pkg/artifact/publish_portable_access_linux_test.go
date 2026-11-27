@@ -185,6 +185,13 @@ func TestPublishRetainedParentsAreNotOpened(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
+					if !report.Refs {
+						t.Fatal("retained graph must be complete")
+					}
+					requireReferenceSet(t, report.SandboxRefs, result.SandboxRef, disk.String())
+					if memoryRoot {
+						requireReferenceSet(t, report.SnapshotRefs, result.Ref, memory.String())
+					}
 					for _, removed := range report.RemovedRefs {
 						if removed == disk.String() || removed == memory.String() {
 							t.Fatalf("retained parent reported removed: %s", removed)

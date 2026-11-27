@@ -258,6 +258,11 @@ Disk export follows the same dependency policy as Sandbox publication. It retain
 
 The named destination replaces the Manifest Store destination. Its syntax, validation, and input-location conflict rules match `sandbox-ctl publish --to-ref-location`. The target name also resolves source references with that name; an explicit `--ref-location` for the same name must identify the same directory. A file-only named export can omit Manifest configuration and use `MANIFEST_KEY` for the default Bundle encryption policy. A disk whose complete graph is already published needs no new Bundle, Store write, or named-directory write. The returned `DiskV1` always lists the complete ordered graph and can contain both new and retained references.
 
+Default stdout and local `--output --json` remain a bare DiskV1. Explicit
+`--upload --json` returns `disk: DiskV1` with `refs`, `diskRefs` and
+`removedRefs`; consumers binding that JSON must select its `disk` field.
+See the [upload report contract](artifacts.md#publication-report).
+
 `export --to-ref-location` is supported only with `--source-ref E-or-S --disk NAME --upload`; live capture, `--checkpoint`, image assembly with `--from`, and `--output` do not accept it. For example:
 
 ```bash

@@ -161,7 +161,10 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 			return result, err
 		}
 		ref, err := plan.emitSandbox(ctx, e)
-		return plan.p.result(RoleSandbox, ref, ref), err
+		if err != nil {
+			return PublishResult{}, err
+		}
+		return plan.p.result(RoleSandbox, ref, ref)
 	}
 	if readretry.IsTerminal(eerr) || readerr.IsPermanent(eerr) {
 		return result, eerr
@@ -253,8 +256,12 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	if err != nil {
 		return result, err
 	}
+	plan.p.report.snapshotRefs = append([]string{}, scfg.FromRefs...)
 	ref, err := p.target.Put(ctx, RoleSnapshot, source)
-	return plan.p.result(RoleSnapshot, ref, scfg.SandboxRef), err
+	if err != nil {
+		return PublishResult{}, err
+	}
+	return plan.p.result(RoleSnapshot, ref, scfg.SandboxRef)
 }
 
 func readRewriteSnapshot(root *snapshotfile.Root) (*snapshot.Config, error) {
@@ -582,15 +589,6 @@ func layeredRewriteValues(values []*rewriteValue) sparse.Source {
 	return fetch.NewLayered(streams...)
 }
 func (p *publicationRewrite) emitValue(ctx context.Context, value *rewriteValue) (ref string, retErr error) {
-	defer func() {
-		if retErr == nil {
-			if ref == value.raw {
-				p.p.retained(ref, value.scope)
-			} else {
-				p.p.retained(ref, publishScope{})
-			}
-		}
-	}()
 	if value.published != "" {
 		return value.published, nil
 	}
@@ -620,7 +618,6 @@ func (p *publicationRewrite) emitChain(ctx context.Context, chain *rewriteChain)
 			ref, err = p.emitValue(ctx, chain.values[0])
 		}
 		if err == nil {
-			p.p.retained(ref, publishScope{})
 			*chain.base = ref
 		}
 		return err
@@ -655,10 +652,8 @@ func (p *publicationRewrite) emitSandbox(ctx context.Context, e *sandboxRewrite)
 	if err != nil {
 		return "", err
 	}
+	p.p.sandboxGroup(e.cfg)
 	ref, err := p.p.target.Put(ctx, RoleSandbox, source)
-	if err == nil {
-		p.p.retained(ref, publishScope{})
-	}
 	return ref, err
 }
 

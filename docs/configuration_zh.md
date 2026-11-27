@@ -235,6 +235,10 @@ sandbox-ctl disk bind --path-id receiver --disk input --disk-spec work.disk.json
 
 具名目标替代 Manifest Store 目标。其语法、校验和输入位置冲突规则与 `sandbox-ctl publish --to-ref-location` 一致。目标名称也用于解析同名来源引用；显式提供同名 `--ref-location` 时，必须指向同一目录。仅涉及文件的具名导出可以省略 Manifest 配置，通过 `MANIFEST_KEY` 满足默认 Bundle 加密策略。完整盘图已经发布时，不新建 Bundle，也不写入 Store 或具名目录。返回的 `DiskV1` 始终列全有序层图，可以同时包含新生成和原样保留的引用。
 
+默认 stdout 及本地 `--output --json` 仍为裸 DiskV1。显式 `--upload --json`
+返回 `disk: DiskV1` 与 `refs`、`diskRefs`、`removedRefs`；将该 JSON 用于绑定时
+需要提取 `disk` 字段。详见[上传报告合同](artifacts_zh.md#publication-report)。
+
 `export --to-ref-location` 仅支持与 `--source-ref E-or-S --disk NAME --upload` 一起使用；实时捕获、`--checkpoint`、通过 `--from` 组装镜像，以及 `--output` 均不接受此参数。例如：
 
 ```bash
