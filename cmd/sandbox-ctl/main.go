@@ -189,7 +189,9 @@ configuration. It is required for any manifest:// resource and for local
 file artifacts when crypto.local is auto or required. file://-only off-mode
 configurations may omit it. The sensitive manifest.key may be supplied via
 the MANIFEST_KEY env var instead of the config file (MANIFEST_KEY overrides
-a manifest.key set in the file).
+a manifest.key set in the file). Both accept a 64-character hex key or a
+Secret plugin reference such as @kms/tenant/manifest-v1. Configure plugins
+with KUASAR_SECRET_PLUGINS; see docs/artifacts.md#secret-plugins.
 
 run starts one sandbox VM and blocks until the guest exits. Plain --config is
 an explicit cold start. --from opens a Sandbox E and follows the same cold-start
