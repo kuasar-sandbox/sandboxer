@@ -2,10 +2,12 @@
 
 # sandboxer
 
-首次运行跨组件沙箱或 Demo，推荐从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)
-使用匹配聚合版本的 [workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)。
-本组件仍可独立构建和部署，workbench 不是生产运行的强制依赖。预构建架构以所选
-发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
+按项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)，
+用 `docker pull` 和 `docker run` 启动首个 Sandbox；node-infra 镜像包含相互匹配的平台组件。
+随后按[节点基础设施指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)
+配置持久节点。直接使用本组件时，采用匹配的发布二进制并按[独立使用流程](docs/runtime_zh.md#standalone-workflow)操作。
+源码构建及 [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)
+用于开发、演示和验证。预构建架构以所选发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
 
 `sandboxer` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 的 **MicroVM 生命周期引擎**。它创建 Sandbox,捕获并恢复状态,控制 guest,提供块设备,按需加载内存和磁盘数据,并协调每个 Sandbox 的 cgroup、balloon 与 VMM 生命周期。
 
@@ -34,6 +36,27 @@ Snapshot 复用由显式 parent/child 引用表示。从同一 template 创建�
 | `cloud-hypervisor` | 支持 external memory、UFFD、balloon 与生命周期操作的 patched host VMM |
 
 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) 维护并构建 `sandbox-init`，在 `runtime-v...` archive 中发布，并把同一二进制内嵌为 `sandbox-runtime.bundle` 的 `/sbin/init`。本仓通过 Go 模块依赖消费其公共 guest ABI。
+
+## 文档
+
+独立使用从 [Runtime 完整流程](docs/runtime_zh.md#standalone-workflow)开始；组合多个组件的平台部署
+从[项目快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)开始。
+组件手册平铺于 `docs/`，每个主题同时保留理解一个状态 owner 或稳定边界所需的操作、精确契约和机制。
+
+| 主题 | 适用任务 | 精确契约归属 |
+| --- | --- | --- |
+| [Runtime](docs/runtime_zh.md) | 启动、Launch、run、exec、snapshot、在线 export、恢复与关闭单个 VM | Runtime 状态、API/CLI 操作语义、context 与跨资源捕获 |
+| [配置](docs/configuration_zh.md) | 准备和检查 sandbox.yaml 或 Host overlay | 字段、默认值、校验、合并和输出目标 |
+| [制品](docs/artifacts_zh.md) | 组装 E、reset 保留状态、检查和发布 E/S | Portable schema、身份、依赖图、发布与保留 |
+| [内存](docs/memory_zh.md) | 理解按需恢复和 checkpoint 内存 | Memfd 所有权、UFFD、分层读取、释放页与 dirty history |
+| [块存储](docs/block-storage_zh.md) | 集成 Disk、操作磁盘 checkpoint 和诊断块 I/O | Vhost 传输、不可变 lower、cache、DIFF v3/v4 与回收 |
+| [资源](docs/resources_zh.md) | 配置资源策略并读取 Usage | Capacity/Budget、cgroup、balloon、资源协议与累计计量 |
+| [Guest ABI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi_zh.md) | 准备工作负载或修改 Host/Guest 集成 | sandbox-init 阶段、进程、文件系统、vsock、MUX 与原始观测 |
+| [VMM](docs/vmm_zh.md) | 构建匹配 monitor 或维护补丁 | Cloud Hypervisor/KVM 集成、设备模型、交接与补丁契约 |
+
+八个主题均维护完整中英文版本；Native 构建与 license scope 也有双语指南。指南应与二进制使用相同源码或
+所选发行版。[贡献策略](CONTRIBUTING.md#documentation)规定主题归属，以及重组时如何保留维护中的契约。
+
 
 ## 公开集成 package
 
@@ -121,15 +144,19 @@ Go import surface 保持窄边界:
 | `connector` | `pkg/tapfd` | 接收 TAP 与 network namespace file descriptor |
 | `guest-runtime` | `pkg/guestabi/{proto,mux,fwd}` | Guest 控制协议、多路复用与转发；guest 不依赖 host 生命周期实现 |
 
-独立 Go 构建使用 `go.mod` 中真实可获取的依赖版本。协调 Preview 构建时，检出选定的 `sandboxer`、`accelerator`、`connector` 和 `guest-runtime` Tag，并生成其依赖工作区：
+独立 Go 构建解析 `go.mod` 中提交的依赖版本。跨仓源码构建时，检出相互兼容的 `sandboxer`、
+`accelerator`、`connector` 和 `guest-runtime` revision，再生成依赖工作区：
 
 ```bash
-GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer --source-requirements)" || exit 1
 export GOWORK
 make build
 ```
 
-工作区通过 `use` 选择本地模块，不额外添加 `replace`，也不改写 `go.mod`/`go.sum`；helper 构建继承同一选择。Patched Cloud Hypervisor、Guest Runtime、Kernel 仍是独立的 Native/Runtime 前置。完整系统见[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)。
+工作区使用选定本地模块，并为其声明的内部依赖生成限定版本的 workspace 绑定。内部依赖的
+元数据来自这些本地 checkout；不改写 `go.mod`/`go.sum`，helper 构建继承同一选择。发行复现使用下文的专用
+release target 及精确 Tag/源码核验。Patched Cloud Hypervisor、Guest Runtime、Kernel 仍是独立的
+Native/Runtime 前置。完整系统见[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)。
 
 
 ## Release 模型
@@ -145,26 +172,6 @@ make build
 项目仓独立发布 `release-vX.Y.Z` 聚合版本,精确选择一个 `sandboxer` Tag 和其他各发行单元版本,并验证组合后的完整系统。
 
 版本关系见[项目 Release 文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md),可用的 Stable 聚合版本由 [GitHub Latest Release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) 渠道解析。
-
-## 文档
-
-独立使用从 [Runtime 完整流程](docs/runtime_zh.md#standalone-workflow)开始；组合多个组件的平台部署
-从[项目快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)开始。
-组件手册平铺于 `docs/`，每个主题同时保留理解一个状态 owner 或稳定边界所需的操作、精确契约和机制。
-
-| 主题 | 适用任务 | 精确契约归属 |
-| --- | --- | --- |
-| [Runtime](docs/runtime_zh.md) | 启动、Launch、run、exec、snapshot、在线 export、恢复与关闭单个 VM | Runtime 状态、API/CLI 操作语义、context 与跨资源捕获 |
-| [配置](docs/configuration_zh.md) | 准备和检查 sandbox.yaml 或 Host overlay | 字段、默认值、校验、合并和输出目标 |
-| [制品](docs/artifacts_zh.md) | 组装 E、reset 保留状态、检查和发布 E/S | Portable schema、身份、依赖图、发布与保留 |
-| [内存](docs/memory_zh.md) | 理解按需恢复和 checkpoint 内存 | Memfd 所有权、UFFD、分层读取、释放页与 dirty history |
-| [块存储](docs/block-storage_zh.md) | 集成 Disk、操作磁盘 checkpoint 和诊断块 I/O | Vhost 传输、不可变 lower、cache、DIFF v3/v4 与回收 |
-| [资源](docs/resources_zh.md) | 配置资源策略并读取 Usage | Capacity/Budget、cgroup、balloon、资源协议与累计计量 |
-| [Guest ABI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi_zh.md) | 准备工作负载或修改 Host/Guest 集成 | sandbox-init 阶段、进程、文件系统、vsock、MUX 与原始观测 |
-| [VMM](docs/vmm_zh.md) | 构建匹配 monitor 或维护补丁 | Cloud Hypervisor/KVM 集成、设备模型、交接与补丁契约 |
-
-八个主题均维护完整中英文版本；Native 构建与 license scope 也有双语指南。指南应与二进制使用相同源码或
-所选发行版。[贡献策略](CONTRIBUTING.md#documentation)规定主题归属，以及重组时如何保留维护中的契约。
 
 ## 项目边界
 

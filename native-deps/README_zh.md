@@ -3,7 +3,7 @@
 # sandboxer/native-deps
 
 本目录构建 `sandboxer` 运行期直接消费、但不属于 Go module 的原生产物。
-当前包含 patched `cloud-hypervisor`。`vmlinux`、`envd` 属于
+当前包含 patched `cloud-hypervisor`。`vmlinux`、`envd` 和私有 systemd 安装属于
 `guest-runtime/native-deps`；`librocksdb` 属于 `accelerator`。
 
 Host 安装的 `erofs-utils` 提供 `mkfs.erofs` 及验证工具 `fsck.erofs`、`dump.erofs`；它们不是项目自行构建的 guest-runtime native 制品。
@@ -147,7 +147,7 @@ patch 语义和设备模型详见 [cloud-hypervisor 文档](../docs/vmm_zh.md)�
 
 | 所属方 | 原生制品或工具 |
 | --- | --- |
-| `guest-runtime/native-deps` | `vmlinux`、`envd` |
+| `guest-runtime/native-deps` | `vmlinux`、`envd`、私有 `systemd/` 安装 |
 | Host 安装的 `erofs-utils` | `mkfs.erofs`、`fsck.erofs`、`dump.erofs` |
 | `sandboxer/native-deps` | Patched `cloud-hypervisor` |
 | `accelerator` | `librocksdb` |

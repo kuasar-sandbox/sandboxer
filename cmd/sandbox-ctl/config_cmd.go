@@ -230,14 +230,16 @@ resources:
   # discard: auto (default) mounts writable ext4 with discard; manual uses nodiscard.
   capacity:    { cpu: 2, memory: 8GiB }   # vCPU / memory the guest sees
   allocatable: { cpu: 2, memory: 8GiB }   # <= capacity (no cgroup ⇒ cpu == capacity.cpu)
-network:
-  # Optional: omit this block or use "network: {}" to start without a NIC.
-  # Otherwise set at most one source: tap (pre-existing host TAP) or tapfd (handoff helper).
-  tap: tap0
-  # tapfd: { exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=1"] }
-  # tapfd: { socket: /run/kuasar/connector/sw0/tapfd.sock, request: "VSWITCH=sw0 PORT=1" }
-  ip: 169.254.1.1/31                       # guest CIDR; "" → no IP
-  hostname: my-sandbox
+# Optional NIC: the empty map needs no host network setup.
+# For networking, replace it with a binding supplied by the host, for example:
+network: {}
+# network:
+#   tap: tap0                              # pre-existing host TAP
+#   # Or use one tapfd handoff instead of tap:
+#   # tapfd: { exec: ["connector-ctl", "vswitch", "open-port", "sw0", "--port=1"] }
+#   # tapfd: { socket: /run/kuasar/connector/sw0/tapfd.sock, request: "VSWITCH=sw0 PORT=1" }
+#   ip: 169.254.1.1/31                     # guest CIDR; "" → no IP
+#   hostname: my-sandbox
 boot:
   kernel:  file:///opt/sandbox/vmlinux
   runtime: file:///opt/sandbox/sandbox-runtime.bundle
@@ -245,14 +247,17 @@ boot:
     base: file:///opt/sandbox/app.erofs    # flattened image (erofs, ro lower)
     overlay:
       # diff omitted → auto-default to /var/lib/sandbox/<sid>/<sid>.overlay.diff
-      diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4
+      # Built-in empty ext4 upper; no host formatting step (no journal).
+      # Select an external template instead when other filesystem features are needed.
+      diff_template: mkfs://ext4?size=1GiB
     # Single-disk mode: omit the overlay block above and give the root disk
     # write capability directly (writable ext4, no overlayfs, no second disk):
     #   diff_template: file:///opt/sandbox/root-templates/app-2G.ext4
     # (base optional; launch.exec required — single-disk has no image config.)
 launch:
-  exec: /usr/bin/app                       # or omit to use the image's Entrypoint/Cmd (overlay mode only)
-  args: []
+  # Overlay mode inherits the image's Entrypoint/Cmd. Uncomment to override:
+  # exec: /usr/bin/app
+  # args: []
   env:                                     # portable: re-applied by run --from
     APP_MODE: production
   # ephemeral_env:                        # instance-only: omitted from Sandbox E

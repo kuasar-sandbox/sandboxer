@@ -4,7 +4,7 @@
 
 This directory builds native artifacts consumed directly by `sandboxer` at
 runtime but not included in its Go module. It currently contains patched
-`cloud-hypervisor`. `vmlinux` and `envd` belong to
+`cloud-hypervisor`. `vmlinux`, `envd` and the private systemd installation belong to
 `guest-runtime/native-deps`; `librocksdb` belongs to `accelerator`. Host-installed
 `erofs-utils` supplies `mkfs.erofs` and validation tools such as `fsck.erofs`
 and `dump.erofs`; they are not project-built guest-runtime native artifacts.
@@ -174,7 +174,7 @@ Patch semantics and the device model are specified in
 
 | Owner | Native artifact or tool |
 | --- | --- |
-| `guest-runtime/native-deps` | `vmlinux`, `envd` |
+| `guest-runtime/native-deps` | `vmlinux`, `envd`, private `systemd/` installation |
 | Host `erofs-utils` installation | `mkfs.erofs`, `fsck.erofs`, `dump.erofs` |
 | `sandboxer/native-deps` | Patched `cloud-hypervisor` |
 | `accelerator` | `librocksdb` |

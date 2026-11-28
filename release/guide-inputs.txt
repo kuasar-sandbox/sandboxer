@@ -16,6 +16,8 @@ docs/block-storage.md
 docs/block-storage_zh.md
 docs/resources.md
 docs/resources_zh.md
+docs/disk-qos-linux.md
+docs/disk-qos-linux_zh.md
 docs/guest-abi.md
 docs/guest-abi_zh.md
 docs/vmm.md

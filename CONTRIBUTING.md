@@ -76,12 +76,15 @@ eight shallow capability topics. `runtime` owns one Runtime's operations,
 API/CLI semantics and cross-resource state transitions; `configuration` owns
 host field/default/merge rules; `artifacts` owns E/S state and publication;
 `memory` and `block-storage` own their data paths; `resources` owns execution
-and cumulative usage; `guest-abi` owns sandbox-init and host/Guest protocols;
+and cumulative usage; `guest-abi` maps to the guest-runtime-owned sandbox-init
+and Host/Guest protocol contract;
 `vmm` owns Cloud Hypervisor integration and patches.
 
 Place independent component use and precise implementation contracts here.
 Cross-component deployment and combined user tasks belong to the project
-repository. Guest-runtime packages sandbox-init but does not own its ABI.
+repository. Guest-runtime owns sandbox-init, its shared Guest ABI and its runtime
+packaging. This repository's Guest ABI pages are navigation maps to that owner;
+host lifecycle, host-side integration and compatibility adapters remain here.
 Accelerator owns generic carrier bytes and storage clients; sandboxer owns E/S
 interpretation and runtime storage admission. Keep Guest raw observations in
 the Guest ABI and Host Budget/accounting in resources.

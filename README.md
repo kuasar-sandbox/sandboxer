@@ -2,13 +2,16 @@
 
 # sandboxer
 
-For the first cross-component sandbox or Demo, follow the project
-[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
-with the matching aggregate release and
-[workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md).
-This component can still be built/deployed independently; workbench is not a
-production runtime dependency. Published architectures are specific to the
-selected release; source support does not imply all historical assets exist.
+Run your first sandbox with `docker pull` and `docker run` in the project
+[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md).
+The node-infra image includes the matching platform components. Follow the
+[node infrastructure guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md)
+to configure a persistent node. To use this component directly, follow the
+[standalone workflow](docs/runtime.md#standalone-workflow) with the matching
+published binaries. Source builds and
+[Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md)
+serve development, demos and validation. Published architectures are specific
+to the selected release; source support does not imply all historical assets exist.
 
 `sandboxer` is the **MicroVM lifecycle engine** for [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox). It creates sandboxes, captures and restores state, controls the guest, serves block devices, loads memory and disk data on demand, and coordinates each sandbox's cgroup, balloon, and VMM lifecycle.
 
@@ -37,6 +40,31 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | `cloud-hypervisor` | Patched host VMM for external memory, UFFD, balloon and lifecycle operations |
 
 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) owns and builds `sandbox-init`, publishes it in its `runtime-v...` archive, and embeds the same binary as `/sbin/init` in `sandbox-runtime.bundle`. This repository consumes its public guest ABI as a Go module dependency.
+
+## Documentation
+
+Start with the [standalone Runtime workflow](docs/runtime.md#standalone-workflow).
+Use the [project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
+for a platform deployment that combines components. The component handbook stays
+flat under `docs/`; each topic keeps the operation, stable contract and mechanism
+needed to understand one state owner or boundary.
+
+| Topic | Use it for | Owns the exact contract |
+| --- | --- | --- |
+| [Runtime](docs/runtime.md) | Start, Launch, run, exec, snapshot, live export, restore and close one VM | Runtime state, API/CLI operation semantics, contexts and cross-resource capture |
+| [Configuration](docs/configuration.md) | Prepare and inspect sandbox.yaml or host overlays | Fields, defaults, validation, merges and output destinations |
+| [Artifacts](docs/artifacts.md) | Assemble E, reset retained state, inspect and publish E/S | Portable schemas, identity, dependency graphs, publication and retention |
+| [Memory](docs/memory.md) | Understand lazy restore and checkpoint memory | Memfd ownership, UFFD, layered reads, released pages and dirty history |
+| [Block storage](docs/block-storage.md) | Integrate Disk, operate disk checkpoints and diagnose block I/O | Vhost transport, immutable lowers, cache, DIFF v3/v4 and reclamation |
+| [Resources](docs/resources.md) | Set resource policy and read usage | Capacity/Budget, cgroups, balloon, resource protocol and cumulative accounting |
+| [Guest ABI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi.md) | Prepare workloads or change host/Guest integration | sandbox-init phases, processes, filesystem, vsock, MUX and raw observations |
+| [VMM](docs/vmm.md) | Build a compatible monitor or maintain patches | Cloud Hypervisor/KVM integration, device model, handoffs and patch contracts |
+
+All eight topics have complete English and Chinese editions. Native-build and
+license-scope guides also have both editions. Use the guides from the same source
+or selected release as the binaries. The [contribution policy](CONTRIBUTING.md#documentation)
+defines ownership and how to preserve maintained contracts when reorganizing.
+
 
 ## Public integration packages
 
@@ -128,18 +156,21 @@ The Go import surface is intentionally narrow:
 | `connector` | `pkg/tapfd` | Receive TAP and network-namespace file descriptors |
 | `guest-runtime` | `pkg/guestabi/{proto,mux,fwd}` | Guest control protocol, multiplexing and forwarding; no host lifecycle dependency in the guest |
 
-Standalone Go builds use the obtainable dependency versions committed in `go.mod`.
-For a coordinated Preview build, check out the selected `sandboxer`, `accelerator`,
-`connector` and `guest-runtime` tags and generate their dependency workspace:
+Standalone Go builds resolve the dependency versions committed in `go.mod`.
+For a coordinated source build, check out compatible `sandboxer`, `accelerator`,
+`connector` and `guest-runtime` revisions and generate their dependency workspace:
 
 ```bash
-GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer)" || exit 1
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners sandboxer --source-requirements)" || exit 1
 export GOWORK
 make build
 ```
 
-The workspace uses local modules without additional `replace` directives and leaves
-`go.mod`/`go.sum` unchanged. Helper builds inherit the same selection. Patched Cloud
+The workspace uses the selected local modules and adds version-specific workspace
+bindings for their declared internal requirements. Internal dependency metadata
+comes from those local checkouts; `go.mod`/`go.sum` stay unchanged.
+Helper builds inherit the same selection. Release reproduction uses the dedicated
+release targets below and their exact tag/source checks. Patched Cloud
 Hypervisor, Guest Runtime and Kernel remain separate native/runtime prerequisites.
 Use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox) for the complete system.
 
@@ -156,30 +187,6 @@ The selected owner source declares its complete compiled E2E helper inventory in
 The project repository publishes an independently numbered aggregate `release-vX.Y.Z`, selecting an exact `sandboxer` tag together with exact versions of the other release units and validating the combined system.
 
 See the [project release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md) and the [latest Stable aggregate release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
-
-## Documentation
-
-Start with the [standalone Runtime workflow](docs/runtime.md#standalone-workflow).
-Use the [project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
-for a platform deployment that combines components. The component handbook stays
-flat under `docs/`; each topic keeps the operation, stable contract and mechanism
-needed to understand one state owner or boundary.
-
-| Topic | Use it for | Owns the exact contract |
-| --- | --- | --- |
-| [Runtime](docs/runtime.md) | Start, Launch, run, exec, snapshot, live export, restore and close one VM | Runtime state, API/CLI operation semantics, contexts and cross-resource capture |
-| [Configuration](docs/configuration.md) | Prepare and inspect sandbox.yaml or host overlays | Fields, defaults, validation, merges and output destinations |
-| [Artifacts](docs/artifacts.md) | Assemble E, reset retained state, inspect and publish E/S | Portable schemas, identity, dependency graphs, publication and retention |
-| [Memory](docs/memory.md) | Understand lazy restore and checkpoint memory | Memfd ownership, UFFD, layered reads, released pages and dirty history |
-| [Block storage](docs/block-storage.md) | Integrate Disk, operate disk checkpoints and diagnose block I/O | Vhost transport, immutable lowers, cache, DIFF v3/v4 and reclamation |
-| [Resources](docs/resources.md) | Set resource policy and read usage | Capacity/Budget, cgroups, balloon, resource protocol and cumulative accounting |
-| [Guest ABI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi.md) | Prepare workloads or change host/Guest integration | sandbox-init phases, processes, filesystem, vsock, MUX and raw observations |
-| [VMM](docs/vmm.md) | Build a compatible monitor or maintain patches | Cloud Hypervisor/KVM integration, device model, handoffs and patch contracts |
-
-All eight topics have complete English and Chinese editions. Native-build and
-license-scope guides also have both editions. Use the guides from the same source
-or selected release as the binaries. The [contribution policy](CONTRIBUTING.md#documentation)
-defines ownership and how to preserve maintained contracts when reorganizing.
 
 ## Project boundaries
 

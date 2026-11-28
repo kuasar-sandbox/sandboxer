@@ -2,13 +2,50 @@
 
 # Sandbox 配置参考
 
-本页定义 Host `sandbox.yaml`、有序覆盖、有效默认值和输出目标。先理解字段归属示例，
-再渲染最终配置并运行。配置选择策略；[Runtime](runtime_zh.md) 定义消费配置的操作，
+本页定义 Host `sandbox.yaml`、有序覆盖、有效默认值和输出目标。先准备冷启动工作负载配置或仅含
+Host 字段的恢复投影，再渲染最终配置并运行。配置选择策略；[Runtime](runtime_zh.md) 定义消费配置的操作，
 [资源](resources_zh.md)定义 Budget 与计量，[块存储](block-storage_zh.md)定义存储生命周期。
 
 E/S 的可移植 schema 由[制品](artifacts_zh.md#portable-config)定义；Guest 消息和进程语义由
 [Guest ABI](guest-abi_zh.md)定义。Manifest/store/crypto/cache 配置仍由 accelerator 负责，
 共用 YAML 输入并不意味着这些字段属于 sandbox schema。
+
+## 准备工作负载配置
+
+新应用选择已发布的 Kernel、Runtime、flatten 后镜像及可写文件系统源。新的 ext4 upper 或数据盘
+可以使用内建初始化器。以下完整冷启动配置使用镜像 Entrypoint/Cmd，并增加独立 workspace 数据盘：
+
+```yaml
+resources:
+  capacity: {cpu: 2, memory: 2GiB}
+  allocatable: {cpu: 2, memory: 2GiB}
+boot:
+  kernel: file:///absolute/release/bin/vmlinux
+  runtime: file:///absolute/release/bin/sandbox-runtime.bundle
+  root:
+    base: file:///absolute/images/app.img
+    overlay:
+      diff_template: mkfs://ext4?size=1GiB
+  disks:
+    - name: work
+      diff_template: mkfs://ext4?size=8GiB
+mounts:
+  - {target: /workspace, type: disk, source: work}
+```
+
+替换绝对路径、按工作负载选择容量，再执行
+`sandbox-ctl config --config sandbox.yaml --check strict`。初始化器使用文档定义的无 journal ext4
+格式；需要其他特性时使用外部模板。其容量是设备大小，不是 Host 空间预留，也不是文件系统扩容命令。
+详见[文件系统源](#disk-capacity)。
+
+Workspace 是捕获图中的独立磁盘。从 E 派生或恢复 S 时，其名称、数组位置和挂载拓扑必须稳定。
+普通自动创建的 writer 在 Runtime 退出时删除；依赖保留前，先捕获状态或选择显式/checkpoint 所有权流程。
+预留 `slot` 只声明未来设备，即使带容量也仍未绑定，直到 `disk bind` 收到完整磁盘定义。数据在启动后
+才到达时使用[延迟绑定](#late-binding)，无需准备占位文件或尝试在恢复时修改磁盘拓扑。
+
+内存恢复先用 `sandbox-ctl config --config sandbox.yaml --mode restore -o restore-host.yaml`
+生成仅含 Host 字段的文件，再检查当前 Host 路径和网络身份。不要把冷启动的 `launch`、`files`、
+`mounts` 或 `init` 复制进去；这些属于捕获状态。完整步骤见[独立使用流程](runtime_zh.md#standalone-workflow)。
 
 <a id="sandbox-yaml"></a>
 
@@ -200,6 +237,8 @@ Lower chain 要求 base。冷启动的可写 ext4 设备需要可挂载 base/tem
 启用 `--enable-checkpoint` 后，可写文件归于派生的 checkpoint 目录，包括自动选择的路径，正常退出后也保留。
 该模式的[归属与清理规则](block-storage_zh.md#checkpoints)由块存储契约定义。容量来自所选磁盘源，
 不是 quota 或 resize flag，见[容量与迁移](#disk-capacity)。
+
+<a id="late-binding"></a>
 
 ### 延迟绑定与子目录挂载
 
@@ -490,13 +529,12 @@ kick 即可重试尚未开始的请求；已开始的 I/O 仍须完成排空。�
 预热实例 Launch 与磁盘 slot 绑定不会重置额度；内存恢复使用目标 Host 合并后的 QoS
 策略，制品不携带该策略。
 
-**升级注意：** 旧版省略脏页额度时取最终缓存的一半，本轮改为不增加额外限制，实际
-脏页内存仍受缓存授额约束。旧版规范化配置中已写出的显式正值继续生效；重新生成配置
-或覆盖 `max_dirty_size: 0` 才会采用新默认。应先升级 `sandbox-ctl` / Sandboxer SDK，
-再使用新 Orchestrator 默认配置：旧版既拒绝新增字段，也拒绝显式的 0 脏页额度，而新版
-默认 Host YAML 会包含这个 0。缓存本身没有无限制大小、关闭开关或 DIO 数据操作失败
-后的 buffered 重试。上述控制是 Host policy，不进入 Sandbox E 与 Snapshot S 的
-portable 身份。
+**升级兼容性：** 省略脏页额度或设置 `max_dirty_size: 0` 均不增加额外限制，实际脏页内存
+仍受缓存授额约束。默认取最终缓存一半的旧版本生成的配置包含显式正值，该限制继续生效；
+重新生成配置或设置 `max_dirty_size: 0` 才会采用默认策略。使用相互匹配的 `sandbox-ctl` /
+Sandboxer SDK 与 Orchestrator：拒绝 0 脏页额度或不支持 QoS 字段的旧 reader 无法读取默认
+Host YAML。缓存本身没有无限制大小、关闭开关或 DIO 数据操作失败后的 buffered 重试。
+上述控制是 Host policy，不进入 Sandbox E 与 Snapshot S 的 portable 身份。
 
 缓存物理页仍计入 `sandbox-ctl` 所属 `ctl/` cgroup，不修改 Guest 内存预算、balloon
 或 `vmm/` 控制。共享物理盘的 runner/builder unit 配置与有条件生效的 DIO 优先级见
