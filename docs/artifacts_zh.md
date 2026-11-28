@@ -905,6 +905,33 @@ CaptureRecord 写版本 2，并读取/升级版本 1；固定 Descriptor 仍为�
 原子发布 RAMReleased + Discarded，禁止迟到的 FileReady。取消不需要目录 EX，
 其他 holder 不会阻挡它；物理文件随后按普通 GC 回收。
 
+<a id="secret-plugins"></a>
+
+## 通过 Secret plugin 获取客户密钥
+
+`MANIFEST_KEY` 和 `manifest.key` 支持 64 字符十六进制客户密钥或 Secret plugin
+引用，仍以 `MANIFEST_KEY` 为优先。配置和进程环境保留引用文本；制品访问需要密钥
+时，由 accelerator SDK 取得实际的 32 字节密钥。
+
+```bash
+export KUASAR_SECRET_PLUGINS='kms::/run/secret-broker.sock:cache_ttl=30s:cache_size=4k'
+export MANIFEST_KEY='@kms/tenant-a/manifest-v1'
+```
+
+运行 `sandbox-ctl` 的宿主进程必须能访问 broker socket，包括容器挂载边界内的
+访问。应在启动进程前配置其环境；Guest 不需要 broker socket 或客户密钥。
+YAML 中的引用必须加引号，例如 `key: "@kms/tenant-a/manifest-v1"`。
+
+SDK 按第一个 `/` 分离插件名，其余 key 作为不透明文本保留，可含后续 `/`、`_`，
+但不能包含冒号或空白。插件未配置或解析失败直接报错，不回退为配置文件中的密钥。
+内容 ID 和 `manifest://...` 等制品引用继续使用原有语法。
+
+每个 `ProcessStorage` 最多解析一次客户密钥，其 Manifest、Bundle、本地及命名
+位置 tarstream、DIFF、借用视图和 checkpoint 保存均使用该结果。插件缓存 TTL
+只控制之后的 SDK 解析，不会让现有存储对象自动换钥。使用稳定、带版本的密钥名称，
+并在仍需读取加密制品时保留对应密钥。SDK 嵌入方继续通过
+`NewProcessStorageWithCustomerKey` 提供作用域内的解析器。
+
 <a id="artifact-publication"></a>
 
 ## 本地与命名位置的 tarstream 加密

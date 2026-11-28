@@ -1037,6 +1037,40 @@ closes RAM, then atomically publishes RAMReleased + Discarded. Late FileReady is
 forbidden. Cancellation needs no directory EX, so other holders cannot block it;
 ordinary GC later reclaims physical files.
 
+<a id="secret-plugins"></a>
+
+## Customer keys from Secret plugins
+
+`MANIFEST_KEY` and `manifest.key` accept either a 64-character hexadecimal
+customer key or a Secret plugin reference. `MANIFEST_KEY` retains precedence.
+The reference stays as text in configuration and the process environment;
+accelerator SDK resolves its actual 32-byte key when artifact access needs it.
+
+```bash
+export KUASAR_SECRET_PLUGINS='kms::/run/secret-broker.sock:cache_ttl=30s:cache_size=4k'
+export MANIFEST_KEY='@kms/tenant-a/manifest-v1'
+```
+
+The broker socket must be accessible to the host process running
+`sandbox-ctl`, including through any container mount boundary. Configure its
+environment before starting that process; no broker socket or customer key is
+needed inside the Guest. YAML references must be quoted, for example
+`key: "@kms/tenant-a/manifest-v1"`.
+
+The SDK splits a reference at its first `/`. The remaining key is opaque and
+keeps further `/` or `_` characters; it cannot contain a colon or whitespace.
+An unknown plugin or failed resolution is an error and never selects the
+configuration-file key as a fallback. Content IDs and artifact references such
+as `manifest://...` keep their existing syntax.
+
+Each `ProcessStorage` resolves its customer key at most once and keeps that
+result for its Manifest, Bundle, local/ref tarstream and DIFF access, including
+borrowed views and checkpoint saving. The plugin's cache TTL controls future
+SDK resolutions; it does not rotate an existing storage object's key. Use
+stable, versioned secret names and retain the corresponding key while its
+encrypted artifacts are needed. SDK embeddings continue to supply a scoped
+resolver through `NewProcessStorageWithCustomerKey`.
+
 <a id="artifact-publication"></a>
 
 ## Local and named-location tarstream encryption
