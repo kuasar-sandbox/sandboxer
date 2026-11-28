@@ -288,21 +288,41 @@ Bundle 的临时解析上下文。
 Sandbox E：
 
 ```json
-{"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}
+{"refs":true,"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}
 ```
 
 Snapshot S：
 
 ```json
-{"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","file://old.snapshot"]}
+{"refs":true,"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","snapshotRefs":["manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.sandbox@digest:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","file://old.snapshot"]}
 ```
 
-Sandbox 仅有 `sandboxRef` 和 `removedRefs`；Snapshot 额外包含 `snapshotRef`。
+`refs:true` 提供全部适用角色的完整引用集合。`sandboxRefs` 包含最终 E 以及根盘、
+数据盘的所有不可变层，包括已接入的 Workspace；`snapshotRefs` 包含最终 S 及其内存
+父层。上例没有保留父层。数组有序、唯一且包含对应主引用，表达集合而非恢复层序。
 Snapshot 的 `sandboxRef` 是最终 S 实际引用的 E，包括复用的 E 或实际选中 Bundle 的
 selector。例如，最终 located Bundle 中的 E 为
 `file://<carrier>.bundle@manifest:<E-key>@location:<name>`；从远端选中的 E 仍为
 `manifest://<E-key>`。不同 carrier、location 或身份域中相同的内容 key 本身不代表
-同一个引用。空 `removedRefs` 必须为 `[]`，不能为 `null`。
+同一个引用。完整报告必须包含 `removedRefs`，空差集使用 `[]`，不能为 `null`。
+完整性描述已知元数据，不表示重新验证所有保留制品此刻均可访问。
+
+`refs:false` 只保留本角色必需的根引用，省略 `snapshotRefs`、`sandboxRefs`、
+`diskRefs` 和 `removedRefs`，即使空或 null 的 `removedRefs` 也不允许。缺失数组
+不代表依赖为空或差集为空。解码器只对缺少 `refs` 且精确符合旧 S/E 报告形状的输入
+按旧规则校验，再归一为 `refs:false` 并丢弃旧差集。显式 false 不能进入该兼容分支。
+null／错误类型的 `refs`、重复或未知字段、角色不匹配及尾随输出仍然报错。
+
+同一报告合同用于 `export --upload --json`，覆盖实时 E、组装 E 和选定磁盘上传。
+本地 `export --output` 与全部 `snapshot` 命令保持原 JSON 和默认输出。publish 默认
+输出完整根引用，E 上传默认输出裸 Manifest key，单盘上传默认输出裸 DiskV1，均不改变。
+
+单盘 `export --source-ref REF --disk NAME --upload --json` 返回 `disk: DiskV1`
+以及 `refs:true`、`diskRefs`、`removedRefs`，包括 `--to-ref-location` 变体。
+`diskRefs` 包含最终 `disk.base` 及全部 `disk.base_from_refs`，排序去重；不设
+`diskRef`，容量与层顺序保留在 `disk`。差集只覆盖选中磁盘，不包含查表用 S/E 根、
+其他磁盘或内存。`--output` 无论是否带 `--json`，仍输出裸 DiskV1。原来消费单盘
+`--upload --json` 裸 DiskV1 的调用方需要改为读取 `disk` 字段。
 
 `removedRefs` 是本次操作已有解析边界内，原拓扑减去最终保留拓扑的差集，包含退出拓扑的
 旧根和已知本地/远端磁盘、内存引用。原配置字段和原生 lower 列表在修改前记录；最终采用、
@@ -313,7 +333,8 @@ selector。例如，最终 located Bundle 中的 E 为
 分支沿用已知边界，不扫描后代。
 
 启用 `--skip-verify-ref` 后，被替换的旧引用无论可读还是缺失，均按叶子处理；报告不会
-为了发现退出引用而打开旧 E 或其后代。显式原生配置
+为了发现退出引用而打开旧 E 或其后代。未选中且载体未知的 Bundle lookup alias 不计入
+已知旧引用集合，不能将它当作 Manifest Store 对象报告。显式原生配置
 `(base=A, base_from_refs=[B,C])` 仍已知 A/B/C 三个引用，显式 `--reduce-ref A=X`
 快路径也必须计入。默认验证模式可复用等价性证明已经解析的原配置。两种模式下，报告均
 不增加对象扫描、payload 读取、摘要计算或临时 payload 文件，只保存有界引用/绑定元数据。
@@ -329,8 +350,10 @@ JSON 不增加 path、context、identifier 或字段映射对象，成功结果�
 已无人使用；其他 checkpoint、保留版本或 sandbox 仍可能引用它。源保留和垃圾回收仍由
 原有职责方负责。
 
-库保留 `PublishResult.Role`/`Ref`，增加 `SandboxRef`、`RemovedRefs`，通过
-`result.Report()` 生成安全的公开 `PublishReport`。仅发布镜像的
+库保留 `PublishResult.Role`/`Ref`、配对 `SandboxRef`、带完整作用域的引用集合及
+已知差集，通过 `result.Report()` 生成安全的公开 `PublishReport`。
+`ExportDisk(ctx, req)` 仍返回 DiskV1；`ExportDiskWithReport(ctx, req)` 在同一次
+导出中返回相同的最终 DiskV1 及报告元数据，由 `Report()` 生成公开磁盘报告。仅发布镜像的
 `PublishSource(ctx, RoleImage, source)` 调用不变。对于已组装 Snapshot，调用方传入已知
 的最终 E：
 
@@ -338,7 +361,9 @@ JSON 不增加 path、context、identifier 或字段映射对象，成功结果�
 result, err := publisher.PublishSource(ctx, artifact.RoleSnapshot, source, cfg.SandboxRef)
 ```
 
-纯创建路径没有原根，差集为空。发布器使用调用方提供的 role 和最终 E，不扫描已组装 source，也不打开其中已经发布的依赖。已组装 source 的所有权仍归调用方。
+该不透明创建路径使用调用方提供的 role 和最终 E，不扫描已组装 source，也不打开
+其中已经发布的依赖。如请求其 S/E 报告，则返回 `refs:false`，省略全部集合及
+`removedRefs`。已组装 source 的所有权仍归调用方。
 
 ```bash
 sandbox-ctl publish --json --quiet --to-ref-location release=file:///srv/sandbox-artifacts ./s1.snapshot

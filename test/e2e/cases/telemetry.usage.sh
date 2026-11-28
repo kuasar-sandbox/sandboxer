@@ -92,6 +92,23 @@ def workload_ready(view, before, name):
     return True
 
 
+def restored_round_ready(view, previous_epoch):
+    assert view["enabled"], "usage unexpectedly disabled"
+    live = view.get("live")
+    if not live:
+        return False
+    assert live["run_epoch"] and live["run_epoch"] != previous_epoch, live
+    counters = {row["name"]: row for row in (live.get("counters") or [])}
+    gauges = {row["name"]: row for row in (live.get("gauges") or [])}
+    fields = ("filesystem.root", "guest.memory")
+    if "guest.cpu" not in counters or any(field not in gauges for field in fields):
+        return False
+    # Restored last values alone are not a new observation. One immediate
+    # post-ACK sample is sufficient; another periodic sample is 60s away.
+    return all(gauges[field]["status"] == "ok" and
+               int(gauges[field]["window"]["samples"]) > 0 for field in fields)
+
+
 def main():
     seconds = 12
     variants = ("off", "overlay", "single", "balloon", "balloon-no-oom", "oom", "multidisk", "restore")
@@ -271,8 +288,9 @@ def main():
                                     base_root=sb.baseroot if same_id else None)
                     try:
                         child.ready()
-                        time.sleep(3)
-                        v = child.view()
+                        v = child.wait_view("restored-first-round",
+                            lambda value: restored_round_ready(value, parent["run_epoch"]),
+                            timeout=min(18, max(0, 60 - (time.monotonic() - restore_started))))
                         elapsed = time.monotonic() - restore_started
                         assert elapsed < 60, ("restore test crossed its first periodic tick", elapsed)
                         write_json(child.dir / "first-round.json", {

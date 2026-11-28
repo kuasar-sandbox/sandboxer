@@ -21,7 +21,7 @@ func printCaptureJSON(resp ctl.Response, role artifact.LogicalRole) int {
 		fmt.Fprintln(os.Stderr, "capture: unexpected runtime response")
 		return 1
 	}
-	report, err := (artifact.PublishResult{Role: role, Ref: root, SandboxRef: resp.SandboxRef}).Report()
+	report, err := (artifact.PublishResult{Role: role, Ref: root, SandboxRef: resp.SandboxRef}).CaptureReport()
 	if err == nil {
 		err = report.ValidateCapture(role)
 	}

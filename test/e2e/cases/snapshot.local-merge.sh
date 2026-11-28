@@ -50,6 +50,46 @@ ip link set "$TAP_NAME" up
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
+free_cache_ports() {
+    python3 - <<'PY'
+import socket
+with socket.socket() as data, socket.socket() as health:
+    data.bind(("", 0))
+    health.bind(("", 0))
+    print(data.getsockname()[1], health.getsockname()[1])
+PY
+}
+cache_startup_diagnostics() {
+    cat "$OUT/cache.log" >&2 || true
+    [ ! -f "$OUT/cache-probe.log" ] || cat "$OUT/cache-probe.log" >&2 || true
+}
+require_cache_alive() {
+    local status=0
+    if kill -0 "$CACHE_PID" 2>/dev/null; then
+        return
+    fi
+    wait "$CACHE_PID" || status=$?
+    cache_startup_diagnostics
+    e2e_fail "cache exited before ready (exit=$status)"
+}
+wait_cache_ready() {
+    for _ in $(seq 1 100); do
+        require_cache_alive
+        if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>>"$OUT/cache-probe.log" | grep -qx SERVING; then
+            require_cache_alive
+            break
+        fi
+        require_cache_alive
+        sleep 0.05
+    done
+    require_cache_alive
+    if ! "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>>"$OUT/cache-probe.log" | grep -qx SERVING; then
+        require_cache_alive
+        cache_startup_diagnostics
+        e2e_fail "cache did not become ready"
+    fi
+    require_cache_alive
+}
 KEY="$(openssl rand -hex 32)"
 STORE_PORT="$(free_port)"
 cat >"$WORK/store.yaml" <<EOF
@@ -67,8 +107,8 @@ for _ in $(seq 1 100); do
 done
 (echo >/dev/tcp/127.0.0.1/"$STORE_PORT") 2>/dev/null || e2e_fail "store did not become ready"
 
-CACHE_PORT="$(free_port)"
-CACHE_HEALTH_PORT="$(free_port)"
+CACHE_PORTS="$(free_cache_ports)"
+read -r CACHE_PORT CACHE_HEALTH_PORT <<<"$CACHE_PORTS"
 cat >"$WORK/cache.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$CACHE_PORT
@@ -86,13 +126,7 @@ EOF
 "$BIN/cache-ctl" serve --config "$WORK/cache.yaml" >"$OUT/cache.log" 2>&1 &
 CACHE_PID=$!
 PIDS+=("$CACHE_PID")
-for _ in $(seq 1 100); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -qx SERVING; then
-        break
-    fi
-    sleep 0.05
-done
-"$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -qx SERVING || e2e_fail "cache did not become ready"
+wait_cache_ready
 
 cat >"$WORK/manifest.yaml" <<EOF
 manifest: { key: "$KEY" }
@@ -111,6 +145,7 @@ truncate -s 1G "$DIFF.template"
 mkfs.ext4 -q -F -O ^has_journal "$DIFF.template"
 
 PYCODE='import os,time
+nonce=os.urandom(16).hex()
 print("PYBOOT-OK", flush=True)
 fd=os.open("/ticks.dat", os.O_RDWR|os.O_CREAT, 0o644)
 i=0
@@ -118,7 +153,7 @@ while True:
     os.pwrite(fd, ("TICK%08d" % i).encode().ljust(4096, b"."), i*4096)
     os.fsync(fd)
     blk0=os.pread(fd,12,0).decode()
-    print("TICK %d DISK blk0=%s" % (i, blk0), flush=True)
+    print("TICK %d DISK blk0=%s NONCE=%s" % (i, blk0, nonce), flush=True)
     i+=1
     time.sleep(0.25)'
 PYCODE_JSON="$(printf '%s' "$PYCODE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
@@ -154,10 +189,12 @@ boot:
 EOF
 }
 
+SOURCE_NONCE=""
 wait_tick() {
-    local log=$1 pid=$2 tick=$3
+    local log=$1 pid=$2 tick=$3 nonce='[0-9a-f]{32}'
+    nonce=${SOURCE_NONCE:-$nonce}
     for _ in $(seq 1 600); do
-        grep -qE "^TICK $tick DISK blk0=TICK00000000$" "$log" 2>/dev/null && return 0
+        grep -qE "^TICK $tick DISK blk0=TICK00000000 NONCE=$nonce$" "$log" 2>/dev/null && return 0
         kill -0 "$pid" 2>/dev/null || {
             tail -60 "$log" >&2 || true
             return 1
@@ -165,6 +202,22 @@ wait_tick() {
         sleep 0.05
     done
     return 1
+}
+
+last_tick() {
+    local tick
+    if ! tick=$(awk -v marker="DISK blk0=TICK00000000 NONCE=$SOURCE_NONCE" '
+        /^TICK([[:space:]]|$)/ { last = $0 }
+        END {
+            n = split(last, fields, " ")
+            if (n != 5 || fields[2] !~ /^[0-9]+$/ ||
+                last != "TICK " fields[2] " " marker) exit 1
+            print fields[2]
+        }' "$1"); then
+        echo "FAIL: missing or invalid final TICK/process/disk record in $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$tick"
 }
 
 SID="local-merge-$BASHPID"
@@ -183,7 +236,13 @@ S1="$SNAPDIR/$SID.snapshot"
 [ -e "$S1" ] || e2e_fail "first local snapshot is missing"
 FROM1="$("$BIN/sandbox-ctl" info --json "$S1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')"
 [ "$FROM1" = "[]" ] || e2e_fail "first local snapshot unexpectedly has parents: $FROM1"
-TICK1="$(grep -oE '^TICK [0-9]+' "$LOG1" | tail -1 | awk '{print $2}')"
+# Capture has stopped the source and drained its output. This nonce exists only
+# in guest process memory; a cold restart cannot pass by counting up again.
+SOURCE_RECORD="$(awk '/^TICK([[:space:]]|$)/ { last=$0 } END { print last }' "$LOG1")"
+[[ "$SOURCE_RECORD" =~ ^TICK\ ([0-9]+)\ DISK\ blk0=TICK00000000\ NONCE=([0-9a-f]{32})$ ]] || \
+    e2e_fail "missing or invalid final source process/disk record: $SOURCE_RECORD"
+TICK1="${BASH_REMATCH[1]}"
+SOURCE_NONCE="${BASH_REMATCH[2]}"
 
 write_restore_config "$WORK/restore2.yaml" "$WORK/restore2.diff"
 LOG2="$OUT/restore2.log"
@@ -198,7 +257,7 @@ PIDS=("$STORE_PID" "$CACHE_PID")
 S2="$SNAPDIR/$SID.snapshot"
 FROM2="$("$BIN/sandbox-ctl" info --json "$S2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')"
 [ "$FROM2" = "[]" ] || e2e_fail "same-owner local parent stacked instead of merging: $FROM2"
-TICK2="$(grep -oE '^TICK [0-9]+' "$LOG2" | tail -1 | awk '{print $2}')"
+TICK2="$(last_tick "$LOG2")"
 
 write_restore_config "$WORK/restore3.yaml" "$WORK/restore3.diff"
 LOG3="$OUT/restore3.log"

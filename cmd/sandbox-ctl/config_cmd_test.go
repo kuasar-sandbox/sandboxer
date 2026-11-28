@@ -23,6 +23,9 @@ func TestConfigTemplateUsesGeneratedUpperAndImageCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cfg.Network.TAP != "" || cfg.Network.TapFD != nil || cfg.Network.Interface != "" {
+		t.Fatalf("cold template requires a host network binding: %+v", cfg.Network)
+	}
 	if cfg.Boot.Root.Overlay == nil {
 		t.Fatal("cold template must select an overlay root")
 	}

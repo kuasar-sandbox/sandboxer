@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
@@ -303,7 +304,7 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 // prepareCheckpointDisks flattens the full same-device local prefix regardless
 // of the memory working-set flag. Only the writable chain is changed; an EROFS
 // immutable base remains a separate device and dependency.
-func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDiskRef) (RunOptions, []snapshot.DiskDiff, []bool, snapshot.MergeBaseOpener, error) {
+func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDiskRef, originalRefs ...func(string)) (RunOptions, []snapshot.DiskDiff, []bool, snapshot.MergeBaseOpener, error) {
 	c0, err := opts.PortableConfig.Clone()
 	if err != nil {
 		return opts, nil, nil, nil, err
@@ -381,24 +382,19 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 					return nil, errors.Join(e, access.Close())
 				}
 				for _, layer := range append([]string{actual.Base}, actual.BaseFromRefs...) {
-					ref, err := manifest.ParseRef(layer)
-					if err != nil {
-						return fail(err)
+					var original string
+					var selected *string
+					if len(originalRefs) != 0 && originalRefs[0] != nil {
+						selected = &original
 					}
-					var stream fetch.Stream
-					if ref.Scheme == manifest.RefSchemeManifest {
-						stream, _, err = OpenManifestStream(ctx, ref.Path, access.Fetcher())
-					} else {
-						var path string
-						path, err = opts.RefLocations.ResolveFile(ref, relativeDir)
-						if err == nil {
-							stream, err = access.OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
-						}
-					}
+					stream, err := openCheckpointPureLayer(ctx, layer, access, opts, relativeDir, selected)
 					if err != nil {
 						return fail(err)
 					}
 					streams = append(streams, stream)
+					if selected != nil && original != "" {
+						originalRefs[0](original)
+					}
 				}
 				size := uint64(d.Size)
 				holes, err := sparse.NewSource(bytes.NewReader(nil), size, []sparse.Extent{{Size: size}})
@@ -444,6 +440,11 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		if len(prefix) == 0 {
 			continue
 		}
+		if len(originalRefs) != 0 && originalRefs[0] != nil {
+			for _, raw := range prefix {
+				originalRefs[0](raw)
+			}
+		}
 		key := fmt.Sprintf("checkpoint-disk-%d", i)
 		parents[key] = prefix
 		diffs[i].MergeBase = key
@@ -466,6 +467,76 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 	}
 	opts.PortableConfig = c0
 	return opts, diffs, merged, opener, nil
+}
+
+// Observe the same source selection that compaction already needs to read.
+// A Manifest alias supplied by a borrowed Bundle is not itself a Store object;
+// without a physical carrier name its old identity is intentionally unknown.
+func openCheckpointPureLayer(ctx context.Context, raw string, access *artifact.ProcessStorage, opts RunOptions, relativeDir string, selected *string) (fetch.Stream, error) {
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return nil, err
+	}
+	record := func(original string) error {
+		if selected == nil || original == "" {
+			return nil
+		}
+		if _, err := artifact.PublicRef(original); err != nil {
+			return err
+		}
+		*selected = original
+		return nil
+	}
+	if ref.Scheme == manifest.RefSchemeManifest {
+		if fetcher, ok := access.Fetcher().(*manifestbundle.ManifestFetcher); selected != nil && ok {
+			key, err := manifest.ParseKeyRef(ref.Path)
+			if err != nil {
+				return nil, err
+			}
+			var source manifestbundle.ManifestSource
+			if err := readretry.Do(ctx, func() error {
+				var err error
+				source, err = fetcher.SelectManifest(ctx, key)
+				return err
+			}); err != nil {
+				return nil, err
+			}
+			lookup := sandboxBundleLookup(opts)
+			if lookup.fetcher != fetcher || lookup.err != nil {
+				lookup = bundleLookup{fetcher: fetcher}
+			}
+			original, err := selectedDependencyRef(ref, source, lookup, opts)
+			if err != nil {
+				return nil, err
+			}
+			if err := record(original); err != nil {
+				return nil, err
+			}
+			return readretry.Open(ctx, func() (fetch.Stream, error) { return source.OpenManifest(ctx, key) })
+		}
+		if err := record(ref.Base().String()); err != nil {
+			return nil, err
+		}
+		stream, _, err := OpenManifestStream(ctx, ref.Path, access.Fetcher())
+		return stream, err
+	}
+	path, err := opts.RefLocations.ResolveFile(ref, relativeDir)
+	if err != nil {
+		return nil, err
+	}
+	if selected != nil {
+		original := ref.Base()
+		if original.Location == "" {
+			original.Path, err = filepath.Abs(path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := record(original.String()); err != nil {
+			return nil, err
+		}
+	}
+	return access.OpenFileWithLocations(ctx, path, ref, opts.RefLocations)
 }
 
 // Reused dependencies already in this checkpoint need no repack, temporary

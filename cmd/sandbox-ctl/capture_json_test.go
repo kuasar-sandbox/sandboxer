@@ -20,6 +20,7 @@ func TestCaptureJSONUsesOnlyActualRuntimePair(t *testing.T) {
 			for _, resume := range []bool{false, true} {
 				for _, jsonOutput := range []bool{false, true} {
 					t.Run(fmt.Sprintf("%s/%s/resume=%t/json=%t", command, mode, resume, jsonOutput), func(t *testing.T) {
+						wantReport := command == "export" && mode == "upload" && jsonOutput
 						dir, err := os.MkdirTemp("", "capture-json-")
 						if err != nil {
 							t.Fatal(err)
@@ -47,6 +48,12 @@ func TestCaptureJSONUsesOnlyActualRuntimePair(t *testing.T) {
 							response.Type = ctl.TypeExportDone
 							role = artifact.RoleSandbox
 						}
+						if wantReport {
+							response.ExportReferences = &ctl.ExportReferences{
+								SandboxRefs: []string{response.SandboxRef, "manifest://" + strings.Repeat("7", 64)},
+								RemovedRefs: []string{},
+							}
+						}
 						listener, err := net.Listen("unix", filepath.Join(run, "ctl.sock"))
 						if err != nil {
 							t.Fatal(err)
@@ -64,7 +71,11 @@ func TestCaptureJSONUsesOnlyActualRuntimePair(t *testing.T) {
 							var req ctl.Request
 							if e = ctl.ReadMessage(c, &req); e == nil {
 								received <- req
-								e = ctl.WriteMessage(c, &response)
+								if wantReport {
+									e = ctl.WriteExportReportResponse(c, response)
+								} else {
+									e = ctl.WriteMessage(c, &response)
+								}
 							}
 							done <- e
 						}()
@@ -95,6 +106,9 @@ func TestCaptureJSONUsesOnlyActualRuntimePair(t *testing.T) {
 						if req.ResumeAfter != resume || req.Upload != (mode == "upload") {
 							t.Fatalf("request=%+v", req)
 						}
+						if (req.Type == ctl.TypeExportReportRequest) != wantReport {
+							t.Fatalf("report request escaped upload JSON scope: %+v", req)
+						}
 						if !jsonOutput {
 							var want string
 							if command == "snapshot" {
@@ -122,7 +136,11 @@ func TestCaptureJSONUsesOnlyActualRuntimePair(t *testing.T) {
 							}
 							return
 						}
-						result, err := artifact.DecodeCaptureReport(out, role)
+						decode := artifact.DecodeCaptureReport
+						if wantReport {
+							decode = artifact.DecodePublishReport
+						}
+						result, err := decode(out, role)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -133,6 +151,12 @@ func TestCaptureJSONUsesOnlyActualRuntimePair(t *testing.T) {
 						}
 						if result.SandboxRef != wantE || result.SnapshotRef != wantS || result.RemovedRefs == nil || len(result.RemovedRefs) != 0 {
 							t.Fatalf("result=%+v", result)
+						}
+						if wantReport && (!result.Refs || len(result.SandboxRefs) != 2) {
+							t.Fatalf("incomplete upload report: %+v", result)
+						}
+						if !wantReport && bytes.Contains(out, []byte(`"refs"`)) {
+							t.Fatalf("new fields changed a legacy capture: %s", out)
 						}
 						if bytes.Contains(out, []byte("unavailable")) {
 							t.Fatalf("directory leak: %s", out)
@@ -157,6 +181,39 @@ func TestCaptureJSONRejectsTornOrWrongResponse(t *testing.T) {
 		out := capturePairStdout(t, func() { code = printCaptureJSON(response, artifact.RoleSnapshot) })
 		if code == 0 || len(out) != 0 {
 			t.Fatalf("torn capture returned success: code=%d out=%s", code, out)
+		}
+	}
+}
+
+func TestExportUploadJSONReportsFinalReferenceSets(t *testing.T) {
+	root := "manifest://" + strings.Repeat("a", 64)
+	parent := "file://shared.bundle@manifest:" + strings.Repeat("b", 64) + "@location:shared"
+	old := "file:///private/checkpoint/old.overlay@digest:" + strings.Repeat("c", 64)
+	response := ctl.Response{Type: ctl.TypeExportDone, SandboxRef: root,
+		ExportReferences: &ctl.ExportReferences{SandboxRefs: []string{root, parent, root}, RemovedRefs: []string{old}}}
+	code, output, diagnostics := captureInfoOutput(t, func() int { return printExportResult(true, response, true) })
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, diagnostics)
+	}
+	report, err := artifact.DecodePublishReport([]byte(output), artifact.RoleSandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicOld, _ := artifact.PublicRef(old)
+	if !report.Refs || len(report.SandboxRefs) != 2 || len(report.RemovedRefs) != 1 || report.RemovedRefs[0] != publicOld {
+		t.Fatalf("bad complete report: %s", output)
+	}
+	if strings.Contains(output, "/private/") || strings.Contains(output, `"diskRef"`) || strings.Contains(output, `"snapshotRefs"`) {
+		t.Fatalf("incorrect layer or private scope: %s", output)
+	}
+	for _, bad := range []ctl.Response{
+		{Type: ctl.TypeExportDone, SandboxRef: root},
+		{Type: ctl.TypeSnapshotDone, SandboxRef: root, ExportReferences: response.ExportReferences},
+		{Type: ctl.TypeExportDone, SandboxRef: root, ExportReferences: &ctl.ExportReferences{SandboxRefs: []string{parent}, RemovedRefs: []string{}}},
+	} {
+		code, output, _ := captureInfoOutput(t, func() int { return printExportResult(true, bad, true) })
+		if code == 0 || output != "" {
+			t.Fatalf("incomplete report became successful output: code=%d stdout=%s", code, output)
 		}
 	}
 }

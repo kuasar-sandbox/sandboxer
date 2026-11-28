@@ -59,7 +59,8 @@
    ```
 
    这是合入模板的配置片段，不是在同一文件中再添加一份 `boot`。
-   仅当 Host 提供 TAP 或 connector 绑定时配置网络字段。随后校验完整文件：
+   模板的 `network: {}` 表示不创建 NIC。工作负载需要联网时，替换为 Host 提供的 TAP 或
+   connector 绑定；注释中的示例不会创建该绑定。随后校验完整文件：
 
    ```bash
    sandbox-ctl config --config sandbox.yaml --check strict
@@ -105,7 +106,7 @@ Snapshot 命令报告已提交的 `snapshotRef` 及其 `sandboxRef`；若输出�
 
 捕获已经冻结受管进程、排空块 I/O，并同步受管 ext4 文件系统。无需在每次捕获前无条件增加 Guest
 全局 `sync` 或清缓存循环。与外部状态协同的应用仍需准备该状态；恢复处理器必须在捕获前安装，见
-[Guest 启动与恢复](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/using-guest-runtime_zh.md#application-restore)。
+[Guest 恢复通知](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/guest-abi_zh.md#restore-notifications)。
 `--drop-caches` 是可选项，不是文件系统一致性的前提。
 
 `--resume` 捕获失败不保证源实例仍可用。若有界重试后重新附着仍无法建立 ACK/MUX，owner 会终止
@@ -580,13 +581,18 @@ Snapshot 始终包含 memory execution state. 一次操作在同一 freeze point
 Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,保持 shell 兼容性. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中. 既有字段名 `memory_resident` 统计显式逻辑内存覆盖量（Data 加 Zero），包括保留为 Zero 的释放页；它不表示物理驻留量或编码后的 payload 大小。
 
 Capture 的 `snapshot --json` 恰好返回 `{snapshotRef,sandboxRef,removedRefs}`，
-`export --json` 恰好返回 `{sandboxRef,removedRefs}`，capture 的 `removedRefs` 固定为
+本地 E `export --output DIR --json` 恰好返回 `{sandboxRef,removedRefs}`，capture 的 `removedRefs` 固定为
 `[]`。身份直接来自成功的 runtime 响应（`export --from` 则来自 assembly 生产者）。CLI
 不重新打开 S，也不根据扩展名推断 E。单根 Bundle 的两个 selector 都绑定实际最终
 Bundle 文件；upload Snapshot 返回两个实际 Manifest 身份。本地引用仅公开 basename，
 保留 `@digest`、`@hmac`、`@manifest` 及已有 location，输出目录留在调用方执行上下文。
 缺失或无效的响应返回错误，不输出成功 JSON。`--resume` 使用同一身份契约；不带
 `--json` 时继续保留原有人类可读输出和 upload key stdout。
+
+`export --upload --json` 返回[发布结果](artifacts_zh.md#publication-report)中的完整
+E 报告，适用于实时捕获与 `--from` 组装，不改变任何 `snapshot` 输出。实时上传报告
+使用独立控制请求，使旧 owner 在捕获前拒绝不支持的请求。响应在既有 64 KiB 控制帧
+限额内分片传递，不因完整报告超过单帧而截断引用或降级为未知。
 
 RFC-142 配对部署必须同时升级 sandboxer 与 orchestrator。操作员升级前须清空旧
 orchestrator 本地数据库并重新创建记录；两个组件均不迁移、不回填，也不自动删除用户

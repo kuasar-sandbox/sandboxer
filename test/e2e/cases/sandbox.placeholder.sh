@@ -148,7 +148,42 @@ exec1 -- sha256sum /proc/1/exe >"$WORK/pid1.hash"
 [ "$(cut -d' ' -f1 <"$WORK/pid1.hash")" = "$INIT_HASH" ] || \
     e2e_fail "private PID 1 is not the prepared runtime's placeholder executable"
 
+placeholder_vm_identity() {
+    python3 - "$RUNPID" "$BIN/cloud-hypervisor" <<'PYVM'
+import pathlib,sys
+parent=int(sys.argv[1])
+binary=pathlib.Path(sys.argv[2]).resolve(strict=True)
+# Go may spawn CH from a non-main OS thread. Inspect only this Host's children
+# and match the prepared executable, rather than a system-wide process name.
+children=set()
+for task in pathlib.Path(f"/proc/{parent}/task").iterdir():
+    try:
+        children.update((task/"children").read_text().split())
+    except FileNotFoundError:
+        pass
+matches=[]
+for child in children:
+    process=pathlib.Path("/proc")/child
+    try:
+        if (process/"exe").resolve(strict=True) != binary:
+            continue
+        fields=(process/"stat").read_text().rpartition(")")[2].split()
+    except FileNotFoundError:
+        continue
+    if int(fields[1])==parent:
+        matches.append((int(child),int(fields[19])))
+if len(matches)!=1:
+    raise SystemExit(f"expected one owned Cloud Hypervisor process, got {matches!r}")
+print("%s:%s" % matches[0])
+PYVM
+}
+
 # Killing PID 1 must restart the anchor in place, not reboot the VM.
+VM_BEFORE="$(placeholder_vm_identity)"
+BOOT_ID_BEFORE="$(exec1 -- cat /proc/sys/kernel/random/boot_id | tr -d '\r')"
+[[ "$BOOT_ID_BEFORE" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || \
+    e2e_fail "missing or invalid guest boot ID before placeholder restart"
+printf 'vm=%s boot_id=%s\n' "$VM_BEFORE" "$BOOT_ID_BEFORE" >"$OUT/inplace-before.txt"
 exec1 -- /bin/sh -c 'kill -TERM 1' >/dev/null 2>&1 || true
 for _ in $(seq 1 60); do
     if exec1 -- /bin/sh -c 'echo EXEC-OK-AFTER-RESTART' >"$WORK/restart.out" 2>/dev/null; then
@@ -158,6 +193,11 @@ for _ in $(seq 1 60); do
     sleep 0.1
 done
 assert_contains "$WORK/restart.out" 'EXEC-OK-AFTER-RESTART'
+VM_AFTER="$(placeholder_vm_identity)"
+BOOT_ID_AFTER="$(exec1 -- cat /proc/sys/kernel/random/boot_id | tr -d '\r')"
+printf 'vm=%s boot_id=%s\n' "$VM_AFTER" "$BOOT_ID_AFTER" >"$OUT/inplace-after.txt"
+[ "$VM_AFTER" = "$VM_BEFORE" ] || e2e_fail "placeholder restart replaced Cloud Hypervisor"
+[ "$BOOT_ID_AFTER" = "$BOOT_ID_BEFORE" ] || e2e_fail "placeholder restart rebooted the guest"
 readiness_assert_wire "$WORK/placeholder.ready" "$READER_PID" $'control_ready\nready\n' || \
     e2e_fail "in-place placeholder restart emitted another readiness event"
 assert_contains "$RUNLOG" 'restarting in'

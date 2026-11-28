@@ -94,14 +94,16 @@ boot:
     overlay: { diff: file://$ROOT_DIFF, diff_template: file://$ROOT_DIFF.template }
 launch:
   exec: /usr/local/bin/python3
-  args: ["-c", "import os,time\nfd=os.open('/ticks.dat',os.O_RDWR|os.O_CREAT,0o644)\ni=0\nwhile True:\n os.pwrite(fd,('TICK%08d'%i).encode().ljust(4096,b'.'),i*4096); os.fsync(fd); blk0=os.pread(fd,12,0).decode(); print('TICK %d DISK blk0=%s'%(i,blk0),flush=True); i+=1; time.sleep(.10)"]
+  args: ["-c", "import os,time\nnonce=os.urandom(16).hex()\nfd=os.open('/ticks.dat',os.O_RDWR|os.O_CREAT,0o644)\ni=0\nwhile True:\n os.pwrite(fd,('TICK%08d'%i).encode().ljust(4096,b'.'),i*4096); os.fsync(fd); blk0=os.pread(fd,12,0).decode(); print('TICK %d DISK blk0=%s NONCE=%s'%(i,blk0,nonce),flush=True); i+=1; time.sleep(.10)"]
   restart: never
 EOF
 
+SOURCE_NONCE=""
 wait_tick() {
-    local log=$1 want=$2 pid=$3 marker=${4:-TICK00000000}
+    local log=$1 want=$2 pid=$3 nonce='[0-9a-f]{32}'
+    nonce=${SOURCE_NONCE:-$nonce}
     for _ in $(seq 1 1200); do
-        grep -qE "^TICK $want DISK blk0=$marker$" "$log" 2>/dev/null && return
+        grep -qE "^TICK $want DISK blk0=TICK00000000 NONCE=$nonce$" "$log" 2>/dev/null && return
         kill -0 "$pid" 2>/dev/null || { tail -80 "$log" >&2 || true; e2e_fail "sandbox exited before TICK $want"; }
         sleep 0.05
     done
@@ -110,15 +112,15 @@ wait_tick() {
 }
 last_tick() {
     local tick
-    if ! tick=$(awk -v marker="DISK blk0=TICK00000000" '
+    if ! tick=$(awk -v marker="DISK blk0=TICK00000000 NONCE=$SOURCE_NONCE" '
         /^TICK([[:space:]]|$)/ { last = $0 }
         END {
             n = split(last, fields, " ")
-            if (n != 4 || fields[2] !~ /^[0-9]+$/ ||
+            if (n != 5 || fields[2] !~ /^[0-9]+$/ ||
                 last != "TICK " fields[2] " " marker) exit 1
             print fields[2]
         }' "$1"); then
-        echo "FAIL: missing or invalid final TICK/cold-disk record in $1" >&2
+        echo "FAIL: missing or invalid final TICK/process/disk record in $1" >&2
         return 1
     fi
     printf '%s\n' "$tick"
@@ -147,7 +149,13 @@ wait "$PID1" 2>/dev/null || true
 PIDS=("$STORE_PID")
 SNAP1="${SNAP1#manifest://}"
 [ "${#SNAP1}" -eq 64 ] || e2e_fail "snapshot upload did not return a manifest key"
-SNAP1_TICK=$(last_tick "$LOG1")
+# Capture has stopped the source and drained its output. This nonce exists only
+# in guest process memory; a cold restart cannot pass by counting up again.
+SOURCE_RECORD="$(awk '/^TICK([[:space:]]|$)/ { last=$0 } END { print last }' "$LOG1")"
+[[ "$SOURCE_RECORD" =~ ^TICK\ ([0-9]+)\ DISK\ blk0=TICK00000000\ NONCE=([0-9a-f]{32})$ ]] || \
+    e2e_fail "missing or invalid final source process/disk record: $SOURCE_RECORD"
+SNAP1_TICK="${BASH_REMATCH[1]}"
+SOURCE_NONCE="${BASH_REMATCH[2]}"
 "$BIN/manifest-ctl" verify --manifest-config "$WORK/manifest.yaml" "$SNAP1" >/dev/null
 
 write_host_config "$WORK/restore.yaml" "$WORK/restore.diff" remote-restored

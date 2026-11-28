@@ -1266,6 +1266,10 @@ func handleExportRequest(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	wantReferences := req.Type == ctl.TypeExportReportRequest
+	if wantReferences && (!req.Upload || req.OutDir != "" || req.CheckpointID != "") {
+		return ctl.Response{}, errors.New("export reference report requires upload without a local checkpoint")
+	}
 	req, err = prepareNamedCapture(req, opts, disks)
 	if err != nil {
 		return ctl.Response{}, err
@@ -1341,7 +1345,12 @@ func handleExportRequest(
 	if sourceGuard != nil {
 		defer func() { err = errors.Join(err, sourceGuard.Close()) }()
 	}
-	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
+	var beforeRefs []string
+	var recordOriginal func(string)
+	if wantReferences {
+		recordOriginal = func(raw string) { beforeRefs = append(beforeRefs, raw) }
+	}
+	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks, recordOriginal)
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("export: checkpoint disks: %w", err)
 	}
@@ -1406,11 +1415,14 @@ func handleExportRequest(
 			sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
 		}
 		sinkOpen = true
-		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, req.OutDir, store.WriteAdmission{}, false)
+		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, req.OutDir, store.WriteAdmission{}, false, wantReferences)
 		if err != nil {
 			return ctl.Response{}, err
 		}
 		dependencyPlanOpen = true
+	}
+	if wantReferences {
+		beforeRefs = append(beforeRefs, dependencyPlan.beforeRefs...)
 	}
 	if bundleSink != nil {
 		bundleRefReplacements, err = dependencyPlan.Ingest(ctx, bundleSink, logf)
@@ -1434,6 +1446,13 @@ func handleExportRequest(
 		}
 		if replacement := bundleRefReplacements[parentRef]; replacement != "" {
 			parentRef = replacement
+		}
+	}
+	if wantReferences {
+		// Validate known report identities before quiescing the guest. The final
+		// Store root has the same canonical fixed-size identity as this preview.
+		if _, err := exportReferenceMetadata("manifest://"+strings.Repeat("0", 64), captureC0, beforeRefs); err != nil {
+			return ctl.Response{}, fmt.Errorf("export reference preflight: %w", err)
 		}
 	}
 
@@ -1586,7 +1605,28 @@ func handleExportRequest(
 			go destroyAfterSnapshot(chSock, chProcess, memoryHighLock, releaseMemoryBarrier, chExited, opts.Cfg.CHApiDeadline(), logf)
 		})
 	}
+	if wantReferences {
+		resp.ExportReferences, err = exportReferenceMetadata(out.SandboxRef, out.PortableConfig, beforeRefs)
+		if err != nil {
+			return resp, fmt.Errorf("export reference report: %w", err)
+		}
+	}
 	return resp, nil
+}
+
+func exportReferenceMetadata(root string, cfg *config.PortableSandboxConfig, before []string) (*ctl.ExportReferences, error) {
+	result, err := artifact.NewSandboxPublishResult(root, cfg, before)
+	if err != nil {
+		return nil, err
+	}
+	report, err := result.Report()
+	if err == nil {
+		err = report.Validate(artifact.RoleSandbox)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ctl.ExportReferences{SandboxRefs: report.SandboxRefs, RemovedRefs: report.RemovedRefs}, nil
 }
 
 // handleSnapshotRequest executes one snapshot_request received via
@@ -2399,6 +2439,7 @@ type snapshotBundlePlan struct {
 	replacements map[string]string
 	imports      []dependencyPlanImport
 	copies       []dependencyPlanCopy
+	beforeRefs   []string
 	closed       bool
 }
 
@@ -2408,12 +2449,21 @@ type snapshotBundlePlan struct {
 // emitting any metadata. It is intentionally specific to the Sandbox graph.
 type SandboxDependencyPlan struct{ plan *snapshotBundlePlan }
 
-func PrepareSandboxDependencyPlan(ctx context.Context, opts RunOptions, diskMerged []bool, outputDir string, admission store.WriteAdmission, bundleTarget bool) (*SandboxDependencyPlan, error) {
-	plan, err := prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, outputDir, admission, bundleTarget)
+func PrepareSandboxDependencyPlan(ctx context.Context, opts RunOptions, diskMerged []bool, outputDir string, admission store.WriteAdmission, bundleTarget bool, reportReferences ...bool) (*SandboxDependencyPlan, error) {
+	plan, err := prepareSnapshotDependencyPlan(ctx, opts, nil, diskMerged, outputDir, admission, bundleTarget, reportReferences...)
 	if err != nil {
 		return nil, err
 	}
 	return &SandboxDependencyPlan{plan: plan}, nil
+}
+
+// OriginalRefs returns only the actual sources selected during this plan. It
+// is populated when reference reporting was requested, never from Bundle.Refs.
+func (p *SandboxDependencyPlan) OriginalRefs() []string {
+	if p == nil || p.plan == nil {
+		return nil
+	}
+	return append([]string(nil), p.plan.beforeRefs...)
 }
 
 func (p *SandboxDependencyPlan) Refs() []string {
@@ -2565,6 +2615,7 @@ func prepareSnapshotDependencyPlan(
 	outputDir string,
 	admission store.WriteAdmission,
 	bundleTarget bool,
+	reportReferences ...bool,
 ) (_ *snapshotBundlePlan, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -2575,6 +2626,7 @@ func prepareSnapshotDependencyPlan(
 	}
 
 	plan := &snapshotBundlePlan{admission: admission, replacements: make(map[string]string)}
+	wantReferences := len(reportReferences) != 0 && reportReferences[0]
 	defer func() {
 		if retErr != nil {
 			retErr = errors.Join(retErr, plan.Close())
@@ -2601,9 +2653,17 @@ func prepareSnapshotDependencyPlan(
 			continue
 		}
 		seenLogical[raw] = dependency.role
-		stream, reader, key, label, err := openSnapshotDependency(ctx, dependency, opts, knownPaths, outputDir)
+		var original string
+		var selected *string
+		if wantReferences {
+			selected = &original
+		}
+		stream, reader, key, label, err := openSnapshotDependency(ctx, dependency, opts, knownPaths, outputDir, selected)
 		if err != nil {
 			return nil, err
+		}
+		if wantReferences && original != "" {
+			plan.beforeRefs = append(plan.beforeRefs, original)
 		}
 		prepared, transformed, err := prepareSnapshotDependencyStream(ctx, stream, dependency.role, opts)
 		if err != nil {
@@ -2704,7 +2764,11 @@ func portableSnapshotDependencyRef(ctx context.Context, dependency artifactDepen
 	return physicalRef.String(), true, nil
 }
 
-func openSnapshotDependency(ctx context.Context, dependency artifactDependency, opts RunOptions, knownPaths map[string]string, outputDir string) (fetch.Stream, *manifestbundle.Reader, store.ContentKey, string, error) {
+func openSnapshotDependency(ctx context.Context, dependency artifactDependency, opts RunOptions, knownPaths map[string]string, outputDir string, selections ...*string) (fetch.Stream, *manifestbundle.Reader, store.ContentKey, string, error) {
+	var selected *string
+	if len(selections) != 0 {
+		selected = selections[0]
+	}
 	ref, err := manifest.ParseRef(dependency.raw)
 	if err != nil {
 		return nil, nil, store.ContentKey{}, "", fmt.Errorf("artifact dependency %q: %w", dependency.raw, err)
@@ -2729,11 +2793,20 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 			if err != nil {
 				return nil, nil, store.ContentKey{}, "", err
 			}
+			if selected != nil {
+				*selected, err = selectedDependencyRef(ref, source, lookup, opts)
+				if err != nil {
+					return nil, nil, store.ContentKey{}, "", err
+				}
+			}
 			stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return source.OpenManifest(ctx, key) })
 			return stream, source.Reader, key, label, err
 		}
 		if opts.Fetcher == nil {
 			return nil, nil, store.ContentKey{}, "", fmt.Errorf("%s requires a Manifest fetcher", label)
+		}
+		if selected != nil {
+			*selected = ref.String()
 		}
 		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return opts.Fetcher.OpenManifest(ctx, key) })
 		return stream, nil, key, label, err
@@ -2745,6 +2818,16 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 	if err != nil {
 		return nil, nil, store.ContentKey{}, "", err
 	}
+	if selected != nil {
+		bound := ref.Base()
+		if bound.Location == "" {
+			bound.Path, err = filepath.Abs(path)
+			if err != nil {
+				return nil, nil, store.ContentKey{}, "", err
+			}
+		}
+		*selected = bound.String()
+	}
 	opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
 		opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
 	if err != nil {
@@ -2755,6 +2838,59 @@ func openSnapshotDependency(ctx context.Context, dependency artifactDependency, 
 		key = store.ContentKey{}
 	}
 	return opened, opened.BundleReader(), key, dependency.role.String() + " " + filepath.Base(path), nil
+}
+
+// Bind the selection already made by openSnapshotDependency. Do not select or
+// reopen a carrier again merely to construct the operation's old reference set.
+func selectedDependencyRef(logical manifest.Ref, source manifestbundle.ManifestSource, lookup bundleLookup, opts RunOptions) (string, error) {
+	if source.Reader == nil {
+		return logical.Base().String(), nil
+	}
+	raw, path := source.Ref, ""
+	if source.Reader == lookup.reader {
+		if lookup.binding == nil {
+			// A borrowed current Bundle can be materialized without exposing
+			// its carrier. Its Manifest lookup alias is not a Store identity.
+			return "", nil
+		}
+		raw, path = lookup.binding.RootRef, lookup.binding.RootPath
+	}
+	ref, err := manifest.ParseRef(raw)
+	if err != nil || ref.Scheme != manifest.RefSchemeFile {
+		// The final graph is still complete when the caller did not supply
+		// a physical name for an already-open borrowed source. Only known
+		// old identities contribute to the operation delta.
+		return "", nil
+	}
+	ref = ref.Base()
+	if ref.Location == "" && filepath.Base(ref.Path) == ref.Path && lookup.binding != nil {
+		if parent, err := manifest.ParseRef(lookup.binding.RootRef); err == nil {
+			// A relative sibling selected from bundle/refs is in the current
+			// carrier's named location, not the node's checkpoint namespace.
+			ref.Location = parent.Location
+		}
+	}
+	if ref.Location == "" {
+		if path == "" {
+			relativeDir := ""
+			if lookup.binding != nil && lookup.binding.RootPath != "" {
+				relativeDir = filepath.Dir(lookup.binding.RootPath)
+			}
+			if !filepath.IsAbs(ref.Path) && relativeDir == "" {
+				return "", nil
+			}
+			path, err = opts.RefLocations.ResolveFile(ref, relativeDir)
+			if err != nil {
+				return "", err
+			}
+		}
+		ref.Path, err = filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+	}
+	ref.DigestScheme, ref.Digest = "manifest", logical.Path
+	return ref.String(), nil
 }
 
 func prepareSnapshotDependencyStream(ctx context.Context, stream fetch.Stream, role artifactDependencyRole, opts RunOptions) (fetch.Stream, bool, error) {
